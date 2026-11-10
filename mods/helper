@@ -1,0 +1,1903 @@
+#! /bin/bash
+
+__helper__() {
+    # =========================================================================
+    # OMNIRC STATE & PURE BASH/AWK STRING HELPERS
+    # =========================================================================
+    __preprint_load_omnirc() {
+        declare -gA PREPRINT_CONF 2>/dev/null || true
+        local target="${OMNIRC:-$HOME/.omnirc}"
+        [[ -f "$target" ]] && source "$target"
+    }
+
+    __preprint_save_omnirc() {
+        local target="${OMNIRC:-$HOME/.omnirc}"
+        local tmp="${target}.tmp"
+        local in_block=0
+
+        if [[ -f "$target" ]]; then
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                if [[ "$line" == "# --- PREPRINT AUTO START ---" ]]; then in_block=1; continue; fi
+                if [[ "$line" == "# --- PREPRINT AUTO END ---" ]]; then in_block=0; continue; fi
+                if (( in_block == 0 )); then printf "%s\n" "$line" >> "$tmp"; fi
+            done < "$target"
+        else
+            touch "$tmp"
+        fi
+
+        {
+            echo "# --- PREPRINT AUTO START ---"
+            echo "declare -gA PREPRINT_CONF 2>/dev/null || true"
+            for k in "${!PREPRINT_CONF[@]}"; do
+                echo "PREPRINT_CONF[\"$k\"]=\"${PREPRINT_CONF[$k]}\""
+            done
+            echo "# --- PREPRINT AUTO END ---"
+        } >> "$tmp"
+        mv "$tmp" "$target"
+    }
+
+    __preprint_get_conf() {
+        local db="${1,,}" key="$2"
+        __preprint_load_omnirc
+        local conf="${PREPRINT_CONF[$db]:-}"
+        local -a pairs=()
+        IFS=',' read -ra pairs <<< "$conf"
+        local pair
+        for pair in "${pairs[@]}"; do
+            if [[ "${pair%%:*}" == "$key" ]]; then
+                echo "${pair#*:}"
+                return 0
+            fi
+        done
+        return 1
+    }
+
+    # Pure Bash RFC 3986 URL encoder
+    __preprint_urlencode() {
+        local LC_ALL=C
+        local str="$1" i c out="" hex
+        for (( i=0; i<${#str}; i++ )); do
+            c="${str:i:1}"
+            case "$c" in
+                [a-zA-Z0-9.~_-]) out+="$c" ;;
+                *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
+            esac
+        done
+        printf '%s' "$out"
+    }
+
+    # Pure Bash JSON string escaper
+    __preprint_json_escape() {
+        local s="$1"
+        s="${s//\\/\\\\}"
+        s="${s//\"/\\\"}"
+        s="${s//$'\r'/}"
+        s="${s//$'\n'/\\n}"
+        s="${s//$'\t'/\\t}"
+        printf '%s' "$s"
+    }
+
+    # Pure Bash XML string escaper
+    __preprint_xml_escape() {
+        local s="$1"
+        s="${s//&/&amp;}"
+        s="${s//</&lt;}"
+        s="${s//>/&gt;}"
+        s="${s//\"/&quot;}"
+        s="${s//\'/&apos;}"
+        printf '%s' "$s"
+    }
+
+    # Normalize sort criteria ('time' or 'alpha')
+    __preprint_norm_sort() {
+        local s="${1,,}"
+        case "$s" in
+            alpha|alphabetical|alphabetically|title|name|a) echo "alpha" ;;
+            time|date|t|"") echo "time" ;;
+            *) echo "time" ;;
+        esac
+    }
+
+    # Pure awk + sort pipeline for unified compact entry lines:
+    # Format: [<id>] (<YYYY-MM-DD>) <Title> — <Authors>
+    __preprint_sort_lines() {
+        local sort_by="${1:-time}" rev="${2:-0}"
+        sort_by="$(__preprint_norm_sort "$sort_by")"
+
+        local sort_flags=("-t" $'\x1f' "-k1,1")
+        if [[ "$sort_by" == "time" ]]; then
+            if (( rev == 0 )); then
+                sort_flags+=("-r")
+            fi
+        else
+            if (( rev == 1 )); then
+                sort_flags+=("-r")
+            fi
+        fi
+
+        LC_ALL=C awk -v mode="$sort_by" '
+            /^[ \t]*$/ { next }
+            /^No / { print "~\x1f" $0; next }
+            {
+                line = $0
+                rest = line
+                id = ""
+                if (match(rest, /^\[[^\]]+\][ \t]*/)) {
+                    id = substr(rest, 2, RLENGTH - 2)
+                    sub(/\][ \t]*$/, "", id)
+                    rest = substr(rest, RLENGTH + 1)
+                }
+                paren = ""
+                if (match(rest, /^\([^)]*\)[ \t]*/)) {
+                    paren = substr(rest, 2, RLENGTH - 2)
+                    sub(/\)[ \t]*$/, "", paren)
+                    rest = substr(rest, RLENGTH + 1)
+                }
+                title = rest
+                sub(/[ \t]*—.*$/, "", title)
+
+                if (mode == "alpha") {
+                    key = tolower(title)
+                } else {
+                    if (paren ~ /^[0-9]{4}(-[0-9]{2}(-[0-9]{2})?)?$/) {
+                        key = paren
+                    } else {
+                        key = id
+                    }
+                }
+                printf "%s\x1f%s\n", key, line
+            }
+        ' | LC_ALL=C sort "${sort_flags[@]}" | LC_ALL=C awk -F'\x1f' '{ print $2 }'
+    }
+
+    # =========================================================================
+    # PDF DOWNLOAD HELPER
+    # =========================================================================
+    __preprint_download_entry() {
+        local db="${1,,}" id="$2" out_path="${3:-}"
+        [[ -z "$db" || -z "$id" ]] && return 1
+
+        local pdf_url="" default_name=""
+        case "$db" in
+            arxiv)
+                local clean_id="${id#arXiv:}"
+                pdf_url="https://arxiv.org/pdf/${clean_id}.pdf"
+                default_name="${clean_id//\//_}.pdf"
+                ;;
+            zenodo)
+                local base_url token auth_header=()
+                base_url="$(__preprint_zenodo_base_url)"
+                token="${ZENODO_TOKEN:-$(__preprint_get_conf zenodo token)}"
+                [[ -n "$token" ]] && auth_header=(-H "Authorization: Bearer $token")
+
+                local json
+                json=$(curl -sSL "${auth_header[@]}" "${base_url}/records/${id}" 2>/dev/null)
+                pdf_url=$(LC_ALL=C awk '
+                    { raw = raw $0 "\n" }
+                    END {
+                        s = raw
+                        while (match(s, /"https?:\/\/[^"]+\.pdf(\/content)?"/)) {
+                            u = substr(s, RSTART + 1, RLENGTH - 2)
+                            print u; exit
+                        }
+                        s = raw
+                        while (match(s, /"self"[ \t]*:[ \t]*"https?:\/\/[^"]+\/files\/[^"]+"/)) {
+                            u = substr(s, RSTART, RLENGTH)
+                            sub(/^"self"[ \t]*:[ \t]*"/, "", u)
+                            sub(/"$/, "", u)
+                            print u; exit
+                        }
+                    }
+                ' <<< "$json")
+                default_name="zenodo_${id}.pdf"
+                ;;
+            hal)
+                # Strip version suffix (e.g. hal-05491257v1 -> hal-05491257) so halId_s matches
+                local base_id="$id"
+                if [[ "$base_id" =~ ^(.+)v[0-9]+$ ]]; then
+                    base_id="${BASH_REMATCH[1]}"
+                fi
+
+                local xml file_main arxiv_ext submit_type
+                xml=$(curl -sSL "https://api.archives-ouvertes.fr/search/?q=halId_s:${base_id}&fl=fileMain_s,files_s,arxivId_s,submitType_s&wt=xml" 2>/dev/null)
+                read -r file_main arxiv_ext submit_type < <(LC_ALL=C awk '
+                    BEGIN { RS = ">"; cur_arr = ""; cur_field = ""; fmain = ""; ffirst = ""; arx = ""; stype = "" }
+                    /<arr[ \t]+name="[^"]+"/ {
+                        s = $0; sub(/^.*name="/, "", s); sub(/".*$/, "", s); cur_arr = s; next
+                    }
+                    /<\/arr$/ { cur_arr = ""; next }
+                    /<(str|int|date)[ \t]+name="[^"]+"/ {
+                        s = $0; sub(/^.*name="/, "", s); sub(/".*$/, "", s); cur_field = s; next
+                    }
+                    /<str$/ { cur_field = cur_arr; next }
+                    /<\/str$/ {
+                        val = $0; sub(/<\/str$/, "", val); gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", val)
+                        if (cur_field == "fileMain_s" && val != "") fmain = val
+                        else if (cur_field == "files_s" && ffirst == "" && val != "") ffirst = val
+                        else if (cur_field == "arxivId_s" && val != "") arx = val
+                        else if (cur_field == "submitType_s" && val != "") stype = val
+                        cur_field = ""
+                    }
+                    END {
+                        best_file = (fmain != "" ? fmain : ffirst)
+                        printf "%s\t%s\t%s\n", (best_file != "" ? best_file : "-"), (arx != "" ? arx : "-"), (stype != "" ? stype : "-")
+                    }
+                ' <<< "$xml")
+
+                if [[ -n "$file_main" && "$file_main" != "-" ]]; then
+                    pdf_url="$file_main"
+                elif [[ -n "$arxiv_ext" && "$arxiv_ext" != "-" ]]; then
+                    __log "HAL entry '$base_id' is linked to arXiv:$arxiv_ext; downloading PDF from arXiv..." -t info -l preprint
+                    __preprint_download_entry "arxiv" "$arxiv_ext" "$out_path"
+                    return $?
+                else
+                    # Scrape citation_pdf_url or .pdf link directly from the HAL record page
+                    local page_html
+                    page_html=$(curl -fsSL "https://hal.science/${base_id}" 2>/dev/null)
+                    pdf_url=$(LC_ALL=C awk '
+                        /citation_pdf_url/ {
+                            if (match($0, /content="https?:\/\/[^"]+"/)) {
+                                u = substr($0, RSTART + 9, RLENGTH - 10)
+                                print u; exit
+                            }
+                        }
+                        match($0, /href="https?:\/\/[^"]+\/document"/) {
+                            u = substr($0, RSTART + 6, RLENGTH - 7)
+                            if (fallback == "") fallback = u
+                        }
+                        END { if (fallback != "") print fallback }
+                    ' <<< "$page_html")
+
+                    if [[ -z "$pdf_url" ]]; then
+                        if [[ "$submit_type" == "notice" ]]; then
+                            __log "HAL entry '$base_id' is a metadata-only citation notice (no PDF file uploaded to HAL)." -t warning -l preprint
+                        else
+                            __log "No PDF file is publicly available for HAL entry '$base_id' (it may be a metadata notice or under embargo)." -t error -l preprint
+                        fi
+                        return 1
+                    fi
+                fi
+                default_name="${base_id}.pdf"
+                ;;
+            orcid)
+                local orcid token base_url auth_header=(-H "Accept: application/vnd.orcid+xml")
+                orcid="${ORCID_ID:-$(__preprint_get_conf orcid orcid)}"
+                [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid profile)"
+                token="${ORCID_TOKEN:-$(__preprint_get_conf orcid token)}"
+                base_url="$(__preprint_orcid_base_url)"
+                [[ -n "$token" ]] && auth_header+=(-H "Authorization: Bearer $token")
+
+                local put_code="$id"
+                if [[ "$id" == *":"* ]]; then
+                    orcid="${id%%:*}"
+                    put_code="${id#*:}"
+                fi
+
+                local xml resolved_type resolved_val
+                xml=$(curl -sSL "${auth_header[@]}" "${base_url}/${orcid}/work/${put_code}" 2>/dev/null)
+                read -r resolved_type resolved_val < <(LC_ALL=C awk '
+                    function strip_tag(s) { gsub(/<[^>]+>/, "", s); gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s); return s }
+                    /<common:external-id-type>/  { cur_t = strip_tag($0) }
+                    /<common:external-id-value>/ {
+                        cur_v = strip_tag($0)
+                        if (cur_t == "arxiv") { arxiv_id = cur_v }
+                        else if (cur_t == "hal") { hal_id = cur_v }
+                        else if (cur_t == "doi") { doi_id = cur_v }
+                        cur_t = ""
+                    }
+                    /<work:url>/ { work_url = strip_tag($0) }
+                    END {
+                        if (arxiv_id != "") print "arxiv", arxiv_id
+                        else if (hal_id != "") print "hal", hal_id
+                        else if (work_url ~ /\.pdf$/ || work_url ~ /arxiv\.org\/abs\//) print "url", work_url
+                        else if (doi_id ~ /10\.48550\/arXiv\./) {
+                            sub(/^.*arXiv\./, "", doi_id)
+                            print "arxiv", doi_id
+                        } else if (work_url != "") print "url", work_url
+                    }
+                ' <<< "$xml")
+
+                if [[ "$resolved_type" == "arxiv" ]]; then
+                    __preprint_download_entry "arxiv" "$resolved_val" "$out_path"
+                    return $?
+                elif [[ "$resolved_type" == "hal" ]]; then
+                    __preprint_download_entry "hal" "$resolved_val" "$out_path"
+                    return $?
+                elif [[ "$resolved_type" == "url" ]]; then
+                    pdf_url="${resolved_val/\/abs\//\/pdf\/}"
+                    [[ "$pdf_url" == *arxiv.org/pdf/* && "$pdf_url" != *.pdf ]] && pdf_url="${pdf_url}.pdf"
+                    default_name="orcid_${put_code}.pdf"
+                fi
+                ;;
+        esac
+
+        if [[ -z "$pdf_url" ]]; then
+            __log "Could not resolve a direct PDF URL for '$id' in $db." -t error -l preprint
+            return 1
+        fi
+
+        local dest="$default_name"
+        if [[ -n "$out_path" ]]; then
+            if [[ -d "$out_path" ]]; then
+                dest="${out_path%/}/$default_name"
+            else
+                dest="$out_path"
+            fi
+        fi
+
+        __log "Downloading PDF from $pdf_url -> $dest ..." -t info -l preprint
+        if curl -fL --progress-bar "$pdf_url" -o "$dest"; then
+            __log "Saved PDF to '$dest'." -t success -l preprint
+            return 0
+        else
+            rm -f "$dest" 2>/dev/null
+            __log "Failed to download PDF from '$pdf_url'." -t error -l preprint
+            return 1
+        fi
+    }
+
+    __preprint_prompt_download() {
+        local db="$1" id="$2" download_flag="${3:-0}" out_path="${4:-}"
+        if (( download_flag == 1 )); then
+            __preprint_download_entry "$db" "$id" "$out_path"
+            return $?
+        fi
+        if [[ -t 0 && -t 1 ]]; then
+            local ans=""
+            echo ""
+            read -r -p "Download PDF for '$id'? [y/N] " ans </dev/tty
+            case "$ans" in
+                [Yy]*) __preprint_download_entry "$db" "$id" "$out_path" ;;
+            esac
+        fi
+    }
+
+    # =========================================================================
+    # DATABASE CONFIGURATION MANAGEMENT (preprint database ls/set/rm)
+    # =========================================================================
+    __preprint_database() {
+        __preprint_load_omnirc
+        local action="${1:-ls}"; shift || true
+
+        case "$action" in
+            ls|list)
+                local supported=("arxiv" "zenodo" "hal" "orcid")
+                printf "%-10s %-14s %s\n" "DATABASE" "STATUS" "CONFIGURED KEYS"
+                printf "%-10s %-14s %s\n" "--------" "------" "---------------"
+                local db pair k v
+                for db in "${supported[@]}"; do
+                    if [[ -n "${PREPRINT_CONF[$db]:-}" ]]; then
+                        local -a keys=() pairs=()
+                        IFS=',' read -ra pairs <<< "${PREPRINT_CONF[$db]}"
+                        for pair in "${pairs[@]}"; do
+                            k="${pair%%:*}"
+                            v="${pair#*:}"
+                            if [[ "$k" == "pass" || "$k" == "token" ]]; then
+                                keys+=("${k}:*** (${#v} chars)")
+                            elif [[ "$v" == *" "* ]]; then
+                                keys+=("${k}:\"${v}\"")
+                            else
+                                keys+=("${k}:${v}")
+                            fi
+                        done
+                        printf "%-10s %-14s %s\n" "$db" "registered" "${keys[*]}"
+                    else
+                        printf "%-10s %-14s %s\n" "$db" "unconfigured" "-"
+                    fi
+                done
+                ;;
+            set|new)
+                local db="${1,,}"; shift || true
+                [[ -z "$db" ]] && { __log "Usage: preprint database set <database> [options]" -t error -l preprint; return 1; }
+
+                local token user pass orcid profile sandbox
+                token="$(__preprint_get_conf "$db" token)"
+                user="$(__preprint_get_conf "$db" user)"
+                pass="$(__preprint_get_conf "$db" pass)"
+                orcid="$(__preprint_get_conf "$db" orcid)"
+                profile="$(__preprint_get_conf "$db" profile)"
+                [[ -z "$profile" ]] && profile="$(__preprint_get_conf "$db" author)"
+                sandbox="$(__preprint_get_conf "$db" sandbox)"
+                [[ -z "$sandbox" ]] && sandbox="false"
+
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        --token)            token="$2"; shift 2 ;;
+                        --user)             user="$2"; shift 2 ;;
+                        --pass)             pass="$2"; shift 2 ;;
+                        --orcid)            orcid="$2"; shift 2 ;;
+                        --profile|--author) profile="$2"; shift 2 ;;
+                        --sandbox)          sandbox="true"; shift ;;
+                        --no-sandbox)       sandbox="false"; shift ;;
+                        *) shift ;;
+                    esac
+                done
+                local val="sandbox:$sandbox"
+                [[ -n "$profile" ]] && val+=",profile:$profile"
+                [[ -n "$orcid" ]]   && val+=",orcid:$orcid"
+                [[ -n "$user" ]]    && val+=",user:$user"
+                [[ -n "$pass" ]]    && val+=",pass:$pass"
+                [[ -n "$token" ]]   && val+=",token:$token"
+
+                PREPRINT_CONF["$db"]="$val"
+                __preprint_save_omnirc
+                __log "Database '$db' configured." -t success -l preprint
+                ;;
+            rm|remove)
+                local db="${1,,}"
+                [[ -z "$db" ]] && { __log "Usage: preprint database rm <database>" -t error -l preprint; return 1; }
+                unset "PREPRINT_CONF[$db]"
+                __preprint_save_omnirc
+                __log "Database '$db' removed." -t success -l preprint
+                ;;
+            *)
+                __log "Unknown database command '$action'. Use: ls, set, or rm." -t error -l preprint
+                return 1
+                ;;
+        esac
+    }
+
+    # =========================================================================
+    # COMMAND DISPATCHERS
+    # =========================================================================
+    __preprint_list() {
+        local db="" max=0 sort_by="time" reverse=0
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                entries)       shift ;;
+                -d|--database) db="${2,,}"; shift 2 ;;
+                --database=*)  db="${1#*=}"; db="${db,,}"; shift ;;
+                -n|--max)      max="$2"; shift 2 ;;
+                --max=*)       max="${1#*=}"; shift ;;
+                -s|--sort)     sort_by="$2"; shift 2 ;;
+                --sort=*)      sort_by="${1#*=}"; shift ;;
+                -r|--reverse)  reverse=1; shift ;;
+                -*) shift ;;
+                *) [[ -z "$db" ]] && db="${1,,}"; shift ;;
+            esac
+        done
+
+        if [[ -z "$db" ]]; then
+            __log "Usage: preprint list [entries] <database> [-s/--sort <time|alpha>] [-r/--reverse]" -t error -l preprint
+            return 1
+        fi
+
+        sort_by="$(__preprint_norm_sort "$sort_by")"
+        local raw_out=""
+        case "$db" in
+            arxiv)  raw_out="$(__preprint_arxiv_list "$max" "$sort_by" "$reverse")" || return 1 ;;
+            zenodo) raw_out="$(__preprint_zenodo_list "$max" "$sort_by" "$reverse")" || return 1 ;;
+            hal)    raw_out="$(__preprint_hal_list "$max" "$sort_by" "$reverse")" || return 1 ;;
+            orcid)  raw_out="$(__preprint_orcid_list "$max" "$sort_by" "$reverse")" || return 1 ;;
+            *) __log "Unsupported database '$db'. Choose from: arxiv, zenodo, hal, orcid." -t error -l preprint; return 1 ;;
+        esac
+
+        if [[ -z "$raw_out" || "$raw_out" == "No "* ]]; then
+            echo "${raw_out:-No entries found.}"
+            return 0
+        fi
+
+        __preprint_sort_lines "$sort_by" "$reverse" <<< "$raw_out"
+    }
+
+    __preprint_get() {
+        local target="" db="" max=0 sort_by="time" reverse=0 download=0 out_path="" used_fzf=0
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -d|--database) db="${2,,}"; shift 2 ;;
+                --database=*)  db="${1#*=}"; db="${db,,}"; shift ;;
+                -D|--download) download=1; shift ;;
+                -o|--output)   out_path="$2"; shift 2 ;;
+                --output=*)    out_path="${1#*=}"; shift ;;
+                -n|--max)      max="$2"; shift 2 ;;
+                --max=*)       max="${1#*=}"; shift ;;
+                -s|--sort)     sort_by="$2"; shift 2 ;;
+                --sort=*)      sort_by="${1#*=}"; shift ;;
+                -r|--reverse)  reverse=1; shift ;;
+                -*) shift ;;
+                *) [[ -z "$target" ]] && target="$1"; shift ;;
+            esac
+        done
+
+        if [[ -z "$db" ]]; then
+            __log "Usage: preprint get [<id>] -d/--database <database> [-D/--download] [-o/--output <path>]" -t error -l preprint
+            return 1
+        fi
+
+        if [[ -z "$target" ]]; then
+            if ! command -v fzf >/dev/null 2>&1; then
+                __log "missing 'fzf' for interactive selection (pass <id> or install fzf)." -t error -l preprint
+                return 1
+            fi
+
+            local entries fzf_out key selected rev_flag=()
+            (( reverse == 1 )) && rev_flag=(-r)
+            entries="$(__preprint_list "$db" -n "$max" -s "$sort_by" "${rev_flag[@]}")" || return 1
+            if [[ -z "$entries" || "$entries" == "No "* ]]; then
+                __log "No entries found in '$db' profile." -t info -l preprint
+                return 1
+            fi
+
+            fzf_out=$(printf '%s\n' "$entries" | fzf --expect=ctrl-d --header="[ID] (Date) Title — Authors  |  Enter: details  |  Ctrl-D: download PDF" --prompt="Select $db entry > " --height=50% --layout=reverse --border)
+            [[ -z "$fzf_out" ]] && return 0
+
+            key="${fzf_out%%$'\n'*}"
+            selected="${fzf_out#*$'\n'}"
+            [[ "$key" == "$fzf_out" ]] && { key=""; selected="$fzf_out"; }
+            [[ -z "$selected" ]] && return 0
+
+            if [[ "$selected" =~ ^\[([^]]+)\] ]]; then
+                target="${BASH_REMATCH[1]}"
+            else
+                target="${selected%% *}"
+            fi
+
+            if [[ "$key" == "ctrl-d" ]]; then
+                __preprint_download_entry "$db" "$target" "$out_path"
+                return $?
+            fi
+            used_fzf=1
+        fi
+
+        case "$db" in
+            arxiv)  __preprint_arxiv_get "$target" ;;
+            zenodo) __preprint_zenodo_get "$target" ;;
+            hal)    __preprint_hal_get "$target" ;;
+            orcid)  __preprint_orcid_get "$target" ;;
+            *) __log "Unsupported database '$db'." -t error -l preprint; return 1 ;;
+        esac
+
+        if (( download == 1 || used_fzf == 1 )); then
+            __preprint_prompt_download "$db" "$target" "$download" "$out_path"
+        fi
+    }
+
+    __preprint_search() {
+        local term="" db="" page_size=50 no_fzf=0 sort_by="time" reverse=0 download=0 out_path=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -d|--database) db="${2,,}"; shift 2 ;;
+                --database=*)  db="${1#*=}"; db="${db,,}"; shift ;;
+                -D|--download) download=1; shift ;;
+                -o|--output)   out_path="$2"; shift 2 ;;
+                --output=*)    out_path="${1#*=}"; shift ;;
+                -n|--max)      page_size="$2"; shift 2 ;;
+                --max=*)       page_size="${1#*=}"; shift ;;
+                -s|--sort)     sort_by="$2"; shift 2 ;;
+                --sort=*)      sort_by="${1#*=}"; shift ;;
+                -r|--reverse)  reverse=1; shift ;;
+                -l|--no-fzf)   no_fzf=1; shift ;;
+                -*) shift ;;
+                *)
+                    if [[ -z "$term" ]]; then term="$1"
+                    else term="$term $1"; fi
+                    shift
+                    ;;
+            esac
+        done
+
+        [[ -z "$term" || -z "$db" ]] && {
+            __log "Usage: preprint search <term> -d/--database <database> [-D/--download] [-s/--sort <time|alpha>] [-r/--reverse]" -t error -l preprint
+            return 1
+        }
+        (( page_size <= 0 )) && page_size=50
+        sort_by="$(__preprint_norm_sort "$sort_by")"
+
+        local page=1 offset=0 results="" fzf_out="" key="" selected="" target="" count=0
+
+        if (( no_fzf == 1 )) || [[ ! -t 1 ]] || ! command -v fzf >/dev/null 2>&1; then
+            case "$db" in
+                arxiv)  results="$(__preprint_arxiv_search "$term" "$page_size" 0 "$sort_by" "$reverse")" ;;
+                zenodo) results="$(__preprint_zenodo_search "$term" "$page_size" 1 "$sort_by" "$reverse")" ;;
+                hal)    results="$(__preprint_hal_search "$term" "$page_size" 0 "$sort_by" "$reverse")" ;;
+                orcid)  results="$(__preprint_orcid_search "$term" "$page_size" 0 "$sort_by" "$reverse")" ;;
+                *) __log "Unsupported database '$db'." -t error -l preprint; return 1 ;;
+            esac
+            if [[ -z "$results" || "$results" == "No "* ]]; then
+                echo "${results:-No results found.}"
+            else
+                __preprint_sort_lines "$sort_by" "$reverse" <<< "$results"
+            fi
+            return 0
+        fi
+
+        while true; do
+            offset=$(( (page - 1) * page_size ))
+            case "$db" in
+                arxiv)  results="$(__preprint_arxiv_search "$term" "$page_size" "$offset" "$sort_by" "$reverse")" ;;
+                zenodo) results="$(__preprint_zenodo_search "$term" "$page_size" "$page" "$sort_by" "$reverse")" ;;
+                hal)    results="$(__preprint_hal_search "$term" "$page_size" "$offset" "$sort_by" "$reverse")" ;;
+                orcid)  results="$(__preprint_orcid_search "$term" "$page_size" "$offset" "$sort_by" "$reverse")" ;;
+                *) __log "Unsupported database '$db'." -t error -l preprint; return 1 ;;
+            esac
+
+            if [[ -z "$results" || "$results" == "No "* ]]; then
+                if (( page == 1 )); then
+                    echo "${results:-No results found.}"
+                    return 0
+                else
+                    __log "No more results beyond page $((page - 1))." -t info -l preprint
+                    (( page-- ))
+                    continue
+                fi
+            fi
+
+            results="$(__preprint_sort_lines "$sort_by" "$reverse" <<< "$results")"
+            count=$(printf '%s\n' "$results" | wc -l)
+            local menu="$results"
+            if (( page > 1 )); then
+                menu=".."$'\n'"$menu"
+            fi
+            if (( count >= page_size )); then
+                menu+=$'\n'"..."
+            fi
+
+            local order_label="newest"
+            if [[ "$sort_by" == "time" && $reverse -eq 1 ]]; then order_label="oldest"
+            elif [[ "$sort_by" == "alpha" && $reverse -eq 0 ]]; then order_label="A-Z"
+            elif [[ "$sort_by" == "alpha" && $reverse -eq 1 ]]; then order_label="Z-A"; fi
+
+            fzf_out=$(printf '%s\n' "$menu" | fzf --expect=ctrl-d --header="[ID] (Date) Title — Authors  |  Enter: details  |  Ctrl-D: download PDF" --prompt="Search $db [page $page | $order_label] > " --height=60% --layout=reverse --border)
+            [[ -z "$fzf_out" ]] && return 0
+
+            key="${fzf_out%%$'\n'*}"
+            selected="${fzf_out#*$'\n'}"
+            [[ "$key" == "$fzf_out" ]] && { key=""; selected="$fzf_out"; }
+            [[ -z "$selected" ]] && return 0
+
+            if [[ "$selected" == "..." ]]; then
+                (( page++ ))
+                continue
+            elif [[ "$selected" == ".." ]]; then
+                (( page > 1 )) && (( page-- ))
+                continue
+            fi
+
+            break
+        done
+
+        if [[ "$selected" =~ ^\[([^]]+)\] ]]; then
+            target="${BASH_REMATCH[1]}"
+        else
+            target="${selected%% *}"
+        fi
+
+        if [[ "$key" == "ctrl-d" && "$db" != "orcid" ]]; then
+            __preprint_download_entry "$db" "$target" "$out_path"
+            return $?
+        fi
+
+        case "$db" in
+            arxiv)
+                __preprint_arxiv_get "$target"
+                __preprint_prompt_download "arxiv" "$target" "$download" "$out_path"
+                ;;
+            zenodo)
+                __preprint_zenodo_get "$target"
+                __preprint_prompt_download "zenodo" "$target" "$download" "$out_path"
+                ;;
+            hal)
+                __preprint_hal_get "$target"
+                __preprint_prompt_download "hal" "$target" "$download" "$out_path"
+                ;;
+            orcid)
+                local author_name=""
+                if [[ "$selected" == *" — "* ]]; then
+                    author_name="${selected##* — }"
+                fi
+                local works work_out work_key work_sel put_code
+                works="$(ORCID_ID="$target" ORCID_AUTHOR_NAME="$author_name" __preprint_orcid_list 0 "$sort_by" "$reverse")"
+                if [[ -z "$works" || "$works" == "No "* ]]; then
+                    echo "$works"
+                    return 0
+                fi
+                works="$(__preprint_sort_lines "$sort_by" "$reverse" <<< "$works")"
+                work_out=$(printf '%s\n' "$works" | fzf --expect=ctrl-d --header="[ID] (Date) Title — Authors  |  Enter: details  |  Ctrl-D: download PDF" --prompt="Works for $target > " --height=50% --layout=reverse --border)
+                [[ -z "$work_out" ]] && return 0
+
+                work_key="${work_out%%$'\n'*}"
+                work_sel="${work_out#*$'\n'}"
+                [[ "$work_key" == "$work_out" ]] && { work_key=""; work_sel="$work_out"; }
+                [[ -z "$work_sel" ]] && return 0
+
+                if [[ "$work_sel" =~ ^\[([^]]+)\] ]]; then
+                    put_code="${BASH_REMATCH[1]}"
+                else
+                    put_code="${work_sel%% *}"
+                fi
+
+                if [[ "$work_key" == "ctrl-d" ]]; then
+                    __preprint_download_entry "orcid" "${target}:${put_code}" "$out_path"
+                    return $?
+                fi
+
+                __preprint_orcid_get "${target}:${put_code}"
+                __preprint_prompt_download "orcid" "${target}:${put_code}" "$download" "$out_path"
+                ;;
+        esac
+    }
+
+    __preprint_send() {
+        local file="" db="" meta="" title="" author="" abstract="" category=""
+        local doi="" arxiv_id="" hal_id="" url="" journal="" work_type="preprint" pub_date="" publish=0
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -d|--database) db="${2,,}"; shift 2 ;;
+                --database=*)  db="${1#*=}"; db="${db,,}"; shift ;;
+                -m|--meta)     meta="$2"; shift 2 ;;
+                -t|--title)    title="$2"; shift 2 ;;
+                -a|--author)   author="$2"; shift 2 ;;
+                -A|--abstract) abstract="$2"; shift 2 ;;
+                -c|--category) category="$2"; shift 2 ;;
+                --doi)         doi="$2"; shift 2 ;;
+                --arxiv)       arxiv_id="$2"; shift 2 ;;
+                --hal)         hal_id="$2"; shift 2 ;;
+                --url)         url="$2"; shift 2 ;;
+                --journal)     journal="$2"; shift 2 ;;
+                --type)        work_type="$2"; shift 2 ;;
+                --date)        pub_date="$2"; shift 2 ;;
+                --publish)     publish=1; shift ;;
+                -*) shift ;;
+                *) [[ -z "$file" ]] && file="$1"; shift ;;
+            esac
+        done
+
+        [[ -z "$db" ]] && {
+            __log "Target database required (-d/--database <arxiv|zenodo|hal|orcid>)." -t error -l preprint
+            return 1
+        }
+
+        if [[ "$db" != "orcid" && -z "$file" ]]; then
+            __log "Usage: preprint send <file> -d/--database $db [options]" -t error -l preprint
+            return 1
+        fi
+
+        if [[ -n "$file" && ! -e "$file" ]]; then
+            __log "File or directory not found: '$file'" -t error -l preprint
+            return 1
+        fi
+
+        case "$db" in
+            arxiv)  __preprint_arxiv_send "$file" "$meta" "$title" "$author" "$abstract" "$category" ;;
+            zenodo) __preprint_zenodo_send "$file" "$meta" "$title" "$author" "$abstract" "$publish" "$doi" ;;
+            hal)    __preprint_hal_send "$file" "$meta" "$title" "$author" "$abstract" "$category" ;;
+            orcid)  __preprint_orcid_send "$file" "$meta" "$title" "$author" "$abstract" "$work_type" "$pub_date" "$journal" "$url" "$doi" "$arxiv_id" "$hal_id" ;;
+            *) __log "Unsupported database '$db'." -t error -l preprint; return 1 ;;
+        esac
+    }
+
+    # =========================================================================
+    # 1. ARXIV IMPLEMENTATION (Profile Feed / Account Session / Atom & SWORD)
+    # =========================================================================
+    __preprint_parse_arxiv_atom() {
+        local mode="${1:-compact}"
+        LC_ALL=C awk -v mode="$mode" '
+            function strip_entities(s) {
+                gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); gsub(/&amp;/, "\\&", s); gsub(/&quot;/, "\"", s)
+                return s
+            }
+            BEGIN { in_entry = 0; count = 0 }
+            /<entry>/ {
+                in_entry = 1
+                id = ""; title = ""; pub = ""; upd = ""; summary = ""; authors = ""
+                in_title = 0; in_sum = 0
+                next
+            }
+            /<\/entry>/ {
+                in_entry = 0
+                count++
+                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", title)
+                gsub(/[ \t\r\n]+/, " ", title)
+                title = strip_entities(title)
+                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", summary)
+                gsub(/[ \t\r\n]+/, " ", summary)
+                summary = strip_entities(summary)
+                sub(/^.*\/abs\//, "", id)
+                sub(/^oai:arXiv\.org:/, "", id)
+                date_val = (pub != "" ? pub : upd)
+                pub_short = (date_val != "" ? substr(date_val, 1, 10) : "N/A")
+                if (authors == "") authors = "Unknown Author"
+                if (mode == "detailed") {
+                    printf "ID:        %s\nTitle:     %s\nPublished: %s\nAuthors:   %s\nURL:       https://arxiv.org/abs/%s\nPDF:       https://arxiv.org/pdf/%s.pdf\nAbstract:\n  %s\n", id, title, pub_short, authors, id, id, summary
+                } else {
+                    printf "[%s] (%s) %s — %s\n", id, pub_short, title, authors
+                }
+                next
+            }
+            in_entry {
+                if ($0 ~ /<id>.*<\/id>/) {
+                    s = $0; sub(/^.*<id>/, "", s); sub(/<\/id>.*$/, "", s)
+                    if (id == "") id = s
+                }
+                if ($0 ~ /<published>.*<\/published>/) {
+                    s = $0; sub(/^.*<published>/, "", s); sub(/<\/published>.*$/, "", s)
+                    pub = s
+                }
+                if ($0 ~ /<updated>.*<\/updated>/) {
+                    s = $0; sub(/^.*<updated>/, "", s); sub(/<\/updated>.*$/, "", s)
+                    upd = s
+                }
+                if ($0 ~ /<(name|dc:creator)>.*<\/(name|dc:creator)>/) {
+                    s = $0
+                    sub(/^.*<(name|dc:creator)>/, "", s)
+                    sub(/<\/(name|dc:creator)>.*$/, "", s)
+                    s = strip_entities(s)
+                    authors = (authors == "" ? s : authors ", " s)
+                }
+                if ($0 ~ /<title[^>]*>/) {
+                    in_title = 1
+                    s = $0; sub(/^.*<title[^>]*>/, "", s)
+                    if (s ~ /<\/title>/) {
+                        sub(/<\/title>.*$/, "", s)
+                        in_title = 0
+                    }
+                    title = title " " s
+                    next
+                }
+                if (in_title) {
+                    s = $0
+                    if (s ~ /<\/title>/) {
+                        sub(/<\/title>.*$/, "", s)
+                        in_title = 0
+                    }
+                    title = title " " s
+                    next
+                }
+                if ($0 ~ /<summary[^>]*>/) {
+                    in_sum = 1
+                    s = $0; sub(/^.*<summary[^>]*>/, "", s)
+                    if (s ~ /<\/summary>/) {
+                        sub(/<\/summary>.*$/, "", s)
+                        in_sum = 0
+                    }
+                    summary = summary " " s
+                    next
+                }
+                if (in_sum) {
+                    s = $0
+                    if (s ~ /<\/summary>/) {
+                        sub(/<\/summary>.*$/, "", s)
+                        in_sum = 0
+                    }
+                    summary = summary " " s
+                    next
+                }
+            }
+            END {
+                if (count == 0) exit 1
+            }
+        '
+    }
+
+    __preprint_arxiv_list() {
+        local max="${1:-0}" sort_by="${2:-time}" reverse="${3:-0}"
+        local limit_arg=$(( max > 0 ? max : 2000 ))
+        local profile orcid user pass
+        profile="${ARXIV_PROFILE:-$(__preprint_get_conf arxiv profile)}"
+        [[ -z "$profile" ]] && profile="$(__preprint_get_conf arxiv author)"
+        orcid="${ARXIV_ORCID:-$(__preprint_get_conf arxiv orcid)}"
+        [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid orcid)"
+        user="${ARXIV_USER:-$(__preprint_get_conf arxiv user)}"
+        pass="${ARXIV_PASS:-$(__preprint_get_conf arxiv pass)}"
+
+        local pid=""
+        for pid in "$profile" "$orcid"; do
+            if [[ -n "$pid" && "$pid" != *" "* ]]; then
+                local feed
+                feed=$(curl -fsSL "https://arxiv.org/a/${pid}.atom2" 2>/dev/null)
+                if [[ "$feed" == *"<entry>"* ]]; then
+                    if (( max > 0 )); then
+                        __preprint_parse_arxiv_atom "compact" <<< "$feed" | head -n "$max"
+                    else
+                        __preprint_parse_arxiv_atom "compact" <<< "$feed"
+                    fi
+                    return 0
+                fi
+            fi
+        done
+
+        if [[ -n "$user" && -n "$pass" ]]; then
+            local sword_xml col_url
+            sword_xml=$(curl -fsSL -u "${user}:${pass}" "https://arxiv.org/sword-app/servicedocument" 2>/dev/null)
+            col_url=$(LC_ALL=C awk '
+                /<collection[^>]*href="[^"]+"/ {
+                    s = $0; sub(/^.*<collection[^>]*href="/, "", s); sub(/".*$/, "", s)
+                    print s; exit
+                }
+            ' <<< "$sword_xml")
+
+            if [[ -n "$col_url" ]]; then
+                local col_feed
+                col_feed=$(curl -fsSL -u "${user}:${pass}" "$col_url" 2>/dev/null)
+                if [[ "$col_feed" == *"<entry>"* ]]; then
+                    if (( max > 0 )); then
+                        __preprint_parse_arxiv_atom "compact" <<< "$col_feed" | head -n "$max"
+                    else
+                        __preprint_parse_arxiv_atom "compact" <<< "$col_feed"
+                    fi
+                    return 0
+                fi
+            fi
+
+            local cookie_jar login_page csrf_token dashboard_html detected_pid paper_ids
+            cookie_jar="$(mktemp)"
+            login_page=$(curl -fsSL -c "$cookie_jar" "https://arxiv.org/login" 2>/dev/null)
+            csrf_token=$(LC_ALL=C awk '
+                /name="csrf_token"/ {
+                    s = $0
+                    if (match(s, /value="[^"]+"/)) {
+                        print substr(s, RSTART + 7, RLENGTH - 8)
+                        exit
+                    }
+                }
+            ' <<< "$login_page")
+
+            dashboard_html=$(curl -fsSL -L -b "$cookie_jar" -c "$cookie_jar" \
+                --data-urlencode "username=${user}" \
+                --data-urlencode "password=${pass}" \
+                --data-urlencode "csrf_token=${csrf_token}" \
+                "https://arxiv.org/login" 2>/dev/null)
+            rm -f "$cookie_jar"
+
+            detected_pid=$(LC_ALL=C awk '
+                match($0, /arxiv\.org\/a\/[a-z0-9_-]+_[a-z]_[0-9]+/) {
+                    s = substr($0, RSTART, RLENGTH)
+                    sub(/^.*\/a\//, "", s)
+                    print s; exit
+                }
+            ' <<< "$dashboard_html")
+
+            if [[ -n "$detected_pid" ]]; then
+                __preprint_database set arxiv --profile "$detected_pid" >/dev/null 2>&1
+                local feed
+                feed=$(curl -fsSL "https://arxiv.org/a/${detected_pid}.atom2" 2>/dev/null)
+                if [[ "$feed" == *"<entry>"* ]]; then
+                    if (( max > 0 )); then
+                        __preprint_parse_arxiv_atom "compact" <<< "$feed" | head -n "$max"
+                    else
+                        __preprint_parse_arxiv_atom "compact" <<< "$feed"
+                    fi
+                    return 0
+                fi
+            fi
+
+            paper_ids=$(LC_ALL=C awk '
+                {
+                    s = $0
+                    while (match(s, /\/abs\/([0-9]{4}\.[0-9]{4,5}|[a-z-]+\/[0-9]{7})/)) {
+                        m = substr(s, RSTART + 5, RLENGTH - 5)
+                        if (!(m in seen)) {
+                            seen[m] = 1
+                            out = (out == "" ? m : out "," m)
+                        }
+                        s = substr(s, RSTART + RLENGTH)
+                    }
+                }
+                END { print out }
+            ' <<< "$dashboard_html")
+
+            if [[ -n "$paper_ids" ]]; then
+                curl -sSL "https://export.arxiv.org/api/query?id_list=${paper_ids}&max_results=${limit_arg}" | __preprint_parse_arxiv_atom "compact"
+                return 0
+            fi
+        fi
+
+        __log "Could not resolve arXiv profile entries. Set your arXiv Author ID (from https://arxiv.org/user -> Author Identifier, e.g. 'martins_y_1') or linked ORCID iD via:
+  preprint database set arxiv --profile <author_id>
+  OR
+  preprint database set arxiv --orcid <0000-0000-0000-0000>" -t error -l preprint
+        return 1
+    }
+
+    __preprint_arxiv_get() {
+        local id="${1#arXiv:}"
+        curl -sSL "https://export.arxiv.org/api/query?id_list=${id}" | __preprint_parse_arxiv_atom "detailed" || echo "No entry found for '$id'."
+    }
+
+    __preprint_arxiv_search() {
+        local term="$1" max="${2:-50}" start="${3:-0}" sort_by="${4:-time}" reverse="${5:-0}"
+        local query_str=""
+
+        if [[ "$term" == *:* || "$term" == \"*\" ]]; then
+            query_str="all:$(__preprint_urlencode "$term")"
+            [[ "$term" == *:* ]] && query_str="$(__preprint_urlencode "$term")"
+        else
+            local -a words=()
+            read -ra words <<< "$term"
+            local w ew
+            for w in "${words[@]}"; do
+                [[ -z "$w" ]] && continue
+                ew=$(__preprint_urlencode "$w")
+                if [[ -z "$query_str" ]]; then
+                    query_str="all:${ew}"
+                else
+                    query_str+="+AND+all:${ew}"
+                fi
+            done
+        fi
+
+        local arxiv_order="descending"
+        (( reverse == 1 )) && arxiv_order="ascending"
+
+        curl -sSL "https://export.arxiv.org/api/query?search_query=${query_str}&sortBy=submittedDate&sortOrder=${arxiv_order}&start=${start}&max_results=${max}" | __preprint_parse_arxiv_atom "compact" || echo "No entries found."
+    }
+
+    __preprint_arxiv_send() {
+        local file="$1" meta="$2" title="$3" author="$4" abstract="$5" category="${6:-cs.AI}"
+        local user pass token
+        user="${ARXIV_USER:-$(__preprint_get_conf arxiv user)}"
+        pass="${ARXIV_PASS:-$(__preprint_get_conf arxiv pass)}"
+        token="${ARXIV_TOKEN:-$(__preprint_get_conf arxiv token)}"
+
+        local auth_args=()
+        if [[ -n "$token" ]]; then
+            auth_args=(-H "Authorization: Bearer $token")
+        elif [[ -n "$user" && -n "$pass" ]]; then
+            auth_args=(-u "${user}:${pass}")
+        else
+            __log "arXiv credentials missing. Run: preprint database set arxiv --user <user> --pass <pass> (or --token <token>)" -t error -l preprint
+            return 1
+        fi
+
+        local tmp_dir="" upload_zip="$file"
+        if [[ "$file" != *.zip ]]; then
+            tmp_dir="$(mktemp -d)"
+            upload_zip="$tmp_dir/arxiv_submission.zip"
+            [[ -z "$title" ]] && title="$(basename "${file%.*}")"
+            [[ -z "$author" ]] && author="${USER:-Anonymous}"
+            [[ -z "$abstract" ]] && abstract="Preprint submitted via omni preprint."
+
+            if [[ -n "$meta" && -f "$meta" ]]; then
+                cp "$meta" "$tmp_dir/atom.xml"
+            else
+                local esc_title esc_abs esc_cat authors_xml=""
+                esc_title=$(__preprint_xml_escape "$title")
+                esc_abs=$(__preprint_xml_escape "$abstract")
+                esc_cat=$(__preprint_xml_escape "$category")
+
+                local IFS=';' a
+                for a in $author; do
+                    a="${a#"${a%%[![:space:]]*}"}"
+                    a="${a%"${a##*[![:space:]]}"}"
+                    [[ -z "$a" ]] && continue
+                    authors_xml+="  <author><name>$(__preprint_xml_escape "$a")</name></author>"$'\n'
+                done
+
+                cat > "$tmp_dir/atom.xml" <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<entry xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <title>${esc_title}</title>
+  <summary>${esc_abs}</summary>
+${authors_xml%$'\n'}
+  <arxiv:primary_category term="${esc_cat}" />
+  <category term="${esc_cat}" scheme="http://arxiv.org/schemas/atom" />
+</entry>
+EOF
+            fi
+
+            cp -r "$file" "$tmp_dir/"
+            (cd "$tmp_dir" && zip -qr "$upload_zip" .)
+        fi
+
+        __log "Submitting package '$upload_zip' to arXiv SWORD API..." -t info -l preprint
+        local resp http_code
+        resp=$(curl -sS -w "\n%{http_code}" "${auth_args[@]}" \
+            -H "Content-Type: application/zip" \
+            -H "Content-Disposition: filename=$(basename "$upload_zip")" \
+            -H "Packaging: http://purl.org/net/sword/package/SimpleZip" \
+            --data-binary @"$upload_zip" \
+            "https://arxiv.org/sword-app/deposit" 2>&1)
+
+        [[ -n "$tmp_dir" ]] && rm -rf "$tmp_dir"
+        http_code="${resp##*$'\n'}"
+        local body="${resp%$'\n'*}"
+
+        if [[ "$http_code" =~ ^20[012]$ ]]; then
+            __log "arXiv deposit succeeded (HTTP $http_code)." -t success -l preprint
+            echo "$body"
+        else
+            __log "arXiv deposit failed (HTTP $http_code)." -t error -l preprint
+            echo "$body" >&2
+            return 1
+        fi
+    }
+
+    # =========================================================================
+    # 2. ZENODO IMPLEMENTATION (Profile Depositions via REST API v1 & awk)
+    # =========================================================================
+    __preprint_zenodo_base_url() {
+        local sb
+        sb="$(__preprint_get_conf zenodo sandbox)"
+        if [[ "$sb" == "true" || "${ZENODO_SANDBOX:-0}" == "1" ]]; then
+            echo "https://sandbox.zenodo.org/api"
+        else
+            echo "https://zenodo.org/api"
+        fi
+    }
+
+    __preprint_parse_zenodo_json() {
+        local mode="${1:-list}"
+        LC_ALL=C awk -v mode="$mode" '
+            function unesc(s) {
+                gsub(/\\"/, "\"", s)
+                gsub(/\\\\/, "\\", s)
+                gsub(/\\n/, " ", s)
+                return s
+            }
+            function get_str(chunk, key,    pat, s) {
+                pat = "\"" key "\"[ \t]*:[ \t]*\""
+                if (match(chunk, pat "(\\\\.|[^\"\\\\])*\"")) {
+                    s = substr(chunk, RSTART, RLENGTH)
+                    sub("^" pat, "", s)
+                    sub(/"$/, "", s)
+                    return unesc(s)
+                }
+                return ""
+            }
+            function get_num(chunk, key,    pat, s) {
+                pat = "\"" key "\"[ \t]*:[ \t]*[0-9]+"
+                if (match(chunk, pat)) {
+                    s = substr(chunk, RSTART, RLENGTH)
+                    sub("^.*:[ \t]*", "", s)
+                    return s
+                }
+                return ""
+            }
+            function get_creators(chunk,    s, out, name_pat, m) {
+                out = ""
+                if (match(chunk, /"creators"[ \t]*:[ \t]*\[[^\]]*\]/)) {
+                    s = substr(chunk, RSTART, RLENGTH)
+                    name_pat = "\"name\"[ \t]*:[ \t]*\"(\\\\.|[^\"\\\\])*\""
+                    while (match(s, name_pat)) {
+                        m = substr(s, RSTART, RLENGTH)
+                        s = substr(s, RSTART + RLENGTH)
+                        sub(/^"name"[ \t]*:[ \t]*"/, "", m)
+                        sub(/"$/, "", m)
+                        out = (out == "" ? unesc(m) : out ", " unesc(m))
+                    }
+                }
+                return out
+            }
+            { raw = raw $0 "\n" }
+            END {
+                if (mode == "create") {
+                    id = get_num(raw, "id")
+                    bucket = get_str(raw, "bucket")
+                    if (id == "") exit 1
+                    print id, bucket
+                    exit 0
+                }
+                if (mode == "detailed") {
+                    id = get_num(raw, "id")
+                    if (id == "") {
+                        msg = get_str(raw, "message")
+                        print "Error: " (msg ? msg : "Record not found") > "/dev/stderr"
+                        exit 1
+                    }
+                    doi = get_str(raw, "doi"); if (doi == "") doi = "N/A"
+                    title = get_str(raw, "title"); if (title == "") title = "Untitled"
+                    pub = get_str(raw, "publication_date"); if (pub == "") pub = "N/A"
+                    html = get_str(raw, "html"); if (html == "") html = "N/A"
+                    desc = get_str(raw, "description")
+                    creators = get_creators(raw)
+                    printf "ID:          %s\nDOI:         %s\nTitle:       %s\nPublished:   %s\nAuthors:     %s\nURL:         %s\nDescription:\n  %s\n", id, doi, title, pub, creators, html, desc
+                    exit 0
+                }
+                n = split(raw, recs, /"created"[ \t]*:/)
+                if (n <= 1) {
+                    exit 1
+                }
+                for (i = 2; i <= n; i++) {
+                    c = "\"created\":" recs[i]
+                    id = get_num(c, "id")
+                    title = get_str(c, "title"); if (title == "") title = "Untitled"
+                    pub = substr(get_str(c, "publication_date"), 1, 10)
+                    if (pub == "") pub = substr(get_str(c, "created"), 1, 10)
+                    if (pub == "") pub = "N/A"
+                    creators = get_creators(c)
+                    if (creators == "") creators = "Unknown Author"
+                    printf "[%s] (%s) %s — %s\n", id, pub, title, creators
+                }
+            }
+        '
+    }
+
+    __preprint_zenodo_list() {
+        local max="${1:-0}" sort_by="${2:-time}" reverse="${3:-0}"
+        local size=$(( max > 0 ? max : 1000 ))
+        local token base_url
+        token="${ZENODO_TOKEN:-$(__preprint_get_conf zenodo token)}"
+        base_url="$(__preprint_zenodo_base_url)"
+
+        if [[ -z "$token" ]]; then
+            __log "Zenodo token required to list profile depositions. Run: preprint database set zenodo --token <TOKEN>" -t error -l preprint
+            return 1
+        fi
+
+        curl -sSL -H "Authorization: Bearer $token" "${base_url}/deposit/depositions?size=${size}" | __preprint_parse_zenodo_json "list" || echo "No records found."
+    }
+
+    __preprint_zenodo_get() {
+        local id="$1"
+        local base_url token auth_header=()
+        base_url="$(__preprint_zenodo_base_url)"
+        token="${ZENODO_TOKEN:-$(__preprint_get_conf zenodo token)}"
+        [[ -n "$token" ]] && auth_header=(-H "Authorization: Bearer $token")
+
+        curl -sSL "${auth_header[@]}" "${base_url}/records/${id}" | __preprint_parse_zenodo_json "detailed"
+    }
+
+    __preprint_zenodo_search() {
+        local term="$1" page_size="${2:-50}" page="${3:-1}" sort_by="${4:-time}" reverse="${5:-0}"
+        local base_url enc_term zenodo_sort="mostrecent"
+        base_url="$(__preprint_zenodo_base_url)"
+        enc_term=$(__preprint_urlencode "$term")
+
+        if [[ "$sort_by" == "time" && $reverse -eq 1 ]]; then
+            zenodo_sort="-mostrecent"
+        fi
+
+        curl -sSL "${base_url}/records?q=${enc_term}&sort=${zenodo_sort}&size=${page_size}&page=${page}" | __preprint_parse_zenodo_json "search" || echo "No records found."
+    }
+
+    __preprint_zenodo_send() {
+        local file="$1" meta="$2" title="$3" author="$4" abstract="$5" publish="${6:-0}" doi="$7"
+        local token base_url
+        token="${ZENODO_TOKEN:-$(__preprint_get_conf zenodo token)}"
+        base_url="$(__preprint_zenodo_base_url)"
+
+        if [[ -z "$token" ]]; then
+            __log "Zenodo token missing. Run: preprint database set zenodo --token <TOKEN>" -t error -l preprint
+            return 1
+        fi
+
+        local meta_payload="{}"
+        if [[ -n "$meta" && -f "$meta" ]]; then
+            meta_payload=$(<"$meta")
+        else
+            [[ -z "$title" ]] && title="$(basename "${file%.*}")"
+            [[ -z "$author" ]] && author="${USER:-Anonymous}"
+            [[ -z "$abstract" ]] && abstract="Preprint uploaded via omni preprint tool."
+
+            local esc_title esc_desc esc_doi creators_json=""
+            esc_title=$(__preprint_json_escape "$title")
+            esc_desc=$(__preprint_json_escape "$abstract")
+            esc_doi=$(__preprint_json_escape "$doi")
+
+            local IFS=';' a
+            for a in $author; do
+                a="${a#"${a%%[![:space:]]*}"}"
+                a="${a%"${a##*[![:space:]]}"}"
+                [[ -z "$a" ]] && continue
+                creators_json+="${creators_json:+,}{\"name\":\"$(__preprint_json_escape "$a")\"}"
+            done
+
+            local doi_field=""
+            [[ -n "$esc_doi" ]] && doi_field=",\"doi\":\"${esc_doi}\""
+            meta_payload="{\"metadata\":{\"title\":\"${esc_title}\",\"upload_type\":\"publication\",\"publication_type\":\"preprint\",\"description\":\"${esc_desc}\",\"creators\":[${creators_json}]${doi_field}}}"
+        fi
+
+        __log "Creating Zenodo deposition..." -t info -l preprint
+        local create_resp dep_id bucket_url
+        create_resp=$(curl -sSL -X POST "${base_url}/deposit/depositions" \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            -d "$meta_payload")
+
+        read -r dep_id bucket_url < <(__preprint_parse_zenodo_json "create" <<< "$create_resp") || {
+            __log "Failed to create Zenodo deposition." -t error -l preprint
+            echo "$create_resp" >&2
+            return 1
+        }
+
+        __log "Uploading file '$(basename "$file")' to Zenodo bucket (ID: $dep_id)..." -t info -l preprint
+        if [[ -n "$bucket_url" ]]; then
+            curl -sSL -X PUT "${bucket_url}/$(basename "$file")" \
+                -H "Authorization: Bearer $token" \
+                --upload-file "$file" >/dev/null
+        else
+            curl -sSL -X POST "${base_url}/deposit/depositions/${dep_id}/files" \
+                -H "Authorization: Bearer $token" \
+                -F "name=$(basename "$file")" \
+                -F "file=@${file}" >/dev/null
+        fi
+
+        if (( publish == 1 )); then
+            __log "Publishing Zenodo deposition $dep_id..." -t info -l preprint
+            curl -sSL -X POST "${base_url}/deposit/depositions/${dep_id}/actions/publish" \
+                -H "Authorization: Bearer $token" >/dev/null
+            __log "Zenodo record published! ID: $dep_id" -t success -l preprint
+        else
+            __log "Zenodo draft created! ID: $dep_id (Review at ${base_url%/api}/deposit/${dep_id})" -t success -l preprint
+        fi
+    }
+
+    # =========================================================================
+    # 3. HAL IMPLEMENTATION (Token-level XML parser via RS=">" & SWORD v2)
+    # =========================================================================
+    __preprint_hal_sword_url() {
+        local sb
+        sb="$(__preprint_get_conf hal sandbox)"
+        if [[ "$sb" == "true" || "${HAL_SANDBOX:-0}" == "1" ]]; then
+            echo "https://api-preprod.archives-ouvertes.fr/sword/hal"
+        else
+            echo "https://api.archives-ouvertes.fr/sword/hal"
+        fi
+    }
+
+    __preprint_parse_hal_xml() {
+        local mode="${1:-compact}"
+        LC_ALL=C awk -v mode="$mode" '
+            function unesc_xml(s) {
+                gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); gsub(/&amp;/, "\\&", s); gsub(/&quot;/, "\"", s); gsub(/&apos;/, "\x27", s)
+                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s)
+                gsub(/[ \t\r\n]+/, " ", s)
+                return s
+            }
+            BEGIN {
+                RS = ">"
+                in_doc = 0; count = 0; cur_arr = ""; cur_field = ""
+            }
+            /<doc([ \t]|$)/ {
+                in_doc = 1
+                hid = ""; title = ""; authors = ""
+                pdate = ""; pubdate = ""; subdate = ""; tdate = ""; pyear = ""
+                uri = ""; doi = ""; arx = ""; pdf = ""; ffirst = ""; stype = ""; abstract = ""
+                cur_arr = ""; cur_field = ""
+                next
+            }
+            /<\/doc$/ {
+                if (in_doc) {
+                    in_doc = 0
+                    count++
+                    if (hid == "") hid = "N/A"
+                    if (title == "") title = "Untitled"
+
+                    date = pdate
+                    if (date == "") date = pubdate
+                    if (date == "") date = substr(subdate, 1, 10)
+                    if (date == "") date = substr(tdate, 1, 10)
+                    if (date == "") date = pyear
+                    if (date == "") date = "N/A"
+                    if (length(date) == 4 && date ~ /^[0-9]{4}$/) date = date "-01-01"
+                    if (length(date) == 7 && date ~ /^[0-9]{4}-[0-9]{2}$/) date = date "-01"
+
+                    if (authors == "") authors = "Unknown Author"
+                    if (pdf == "" && ffirst != "") pdf = ffirst
+                    if (pdf == "" && arx != "") pdf = "https://arxiv.org/pdf/" arx ".pdf (via arXiv)"
+                    if (pdf == "" && stype == "notice") pdf = "None (metadata-only notice)"
+
+                    if (mode == "detailed") {
+                        printf "ID:        %s\nTitle:     %s\nDate:      %s\nAuthors:   %s\nDOI:       %s\nURL:       %s\nPDF:       %s\nAbstract:\n  %s\n", hid, title, date, authors, (doi ? doi : "N/A"), uri, (pdf ? pdf : "N/A"), abstract
+                    } else {
+                        printf "[%s] (%s) %s — %s\n", hid, date, title, authors
+                    }
+                }
+                next
+            }
+            in_doc {
+                if (match($0, /<arr[ \t]+name="[^"]+"/)) {
+                    s = substr($0, RSTART, RLENGTH)
+                    sub(/^.*name="/, "", s); sub(/"$/, "", s)
+                    cur_arr = s
+                    next
+                }
+                if ($0 ~ /<\/arr$/) {
+                    cur_arr = ""
+                    next
+                }
+                if (match($0, /<(str|date|int)[ \t]+name="[^"]+"/)) {
+                    s = substr($0, RSTART, RLENGTH)
+                    sub(/^.*name="/, "", s); sub(/"$/, "", s)
+                    cur_field = s
+                    next
+                }
+                if ($0 ~ /<(str|date|int)$/) {
+                    cur_field = cur_arr
+                    next
+                }
+                if ($0 ~ /<\/(str|date|int)$/) {
+                    val = $0
+                    sub(/<\/(str|date|int)$/, "", val)
+                    val = unesc_xml(val)
+                    if (cur_field == "halId_s")                  hid = val
+                    else if (cur_field == "producedDate_s")      pdate = val
+                    else if (cur_field == "publicationDate_s")   pubdate = val
+                    else if (cur_field == "submittedDate_s")     subdate = val
+                    else if (cur_field == "submittedDate_tdate") tdate = val
+                    else if (cur_field == "publicationDateY_i")  pyear = val
+                    else if (cur_field == "uri_s")               uri = val
+                    else if (cur_field == "doiId_s")             doi = val
+                    else if (cur_field == "arxivId_s")           arx = val
+                    else if (cur_field == "submitType_s")        stype = val
+                    else if (cur_field == "fileMain_s")          pdf = val
+                    else if (cur_field == "files_s")             { if (ffirst == "") ffirst = val }
+                    else if (cur_field == "title_s")             { if (title == "") title = val }
+                    else if (cur_field == "abstract_s")          { if (abstract == "") abstract = val }
+                    else if (cur_field == "authFullName_s")      { if (val != "") authors = (authors == "" ? val : authors ", " val) }
+                    cur_field = ""
+                }
+            }
+            END {
+                if (count == 0) exit 1
+            }
+        '
+    }
+
+    __preprint_hal_list() {
+        local max="${1:-0}" sort_by="${2:-time}" reverse="${3:-0}"
+        local rows=$(( max > 0 ? max : 10000 ))
+        local profile orcid user
+        profile="${HAL_PROFILE:-$(__preprint_get_conf hal profile)}"
+        [[ -z "$profile" ]] && profile="$(__preprint_get_conf hal author)"
+        orcid="${HAL_ORCID:-$(__preprint_get_conf hal orcid)}"
+        [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid orcid)"
+        user="${HAL_USER:-$(__preprint_get_conf hal user)}"
+
+        local query=""
+        if [[ -n "$profile" ]]; then
+            query="authIdHal_s:$(__preprint_urlencode "$profile")"
+        elif [[ -n "$orcid" ]]; then
+            query="authOrcidIdExt_s:$(__preprint_urlencode "$orcid")"
+        elif [[ -n "$user" && "$user" != *"@"* ]]; then
+            query="authIdHal_s:$(__preprint_urlencode "$user")"
+        else
+            __log "Set your HAL profile ID (idHAL) or ORCID iD first:
+  preprint database set hal --profile <idhal>
+  OR
+  preprint database set hal --orcid <0000-0000-0000-0000>" -t error -l preprint
+            return 1
+        fi
+
+        local hal_dir="desc"
+        (( reverse == 1 )) && hal_dir="asc"
+        local hal_fl="halId_s,title_s,authFullName_s,producedDate_s,publicationDate_s,submittedDate_s,submittedDate_tdate,publicationDateY_i,uri_s"
+
+        curl -sSL "https://api.archives-ouvertes.fr/search/?q=${query}&fl=${hal_fl}&sort=producedDate_tdate+${hal_dir}&rows=${rows}&wt=xml" | __preprint_parse_hal_xml "compact" || echo "No entries found in HAL."
+    }
+
+    __preprint_hal_get() {
+        local id="$1"
+        local base_id="$id"
+        if [[ "$base_id" =~ ^(.+)v[0-9]+$ ]]; then
+            base_id="${BASH_REMATCH[1]}"
+        fi
+        local hal_fl="halId_s,title_s,authFullName_s,abstract_s,producedDate_s,publicationDate_s,submittedDate_s,submittedDate_tdate,publicationDateY_i,doiId_s,arxivId_s,submitType_s,uri_s,fileMain_s,files_s"
+        curl -sSL "https://api.archives-ouvertes.fr/search/?q=halId_s:${base_id}&fl=${hal_fl}&wt=xml" | __preprint_parse_hal_xml "detailed" || echo "No entry found in HAL."
+    }
+
+    __preprint_hal_search() {
+        local term="$1" rows="${2:-50}" start="${3:-0}" sort_by="${4:-time}" reverse="${5:-0}"
+        local enc_term hal_dir="desc"
+        enc_term=$(__preprint_urlencode "$term")
+        (( reverse == 1 )) && hal_dir="asc"
+        local hal_fl="halId_s,title_s,authFullName_s,producedDate_s,publicationDate_s,submittedDate_s,submittedDate_tdate,publicationDateY_i,uri_s"
+
+        curl -sSL "https://api.archives-ouvertes.fr/search/?q=${enc_term}&fl=${hal_fl}&sort=producedDate_tdate+${hal_dir}&start=${start}&rows=${rows}&wt=xml" | __preprint_parse_hal_xml "compact" || echo "No entries found in HAL."
+    }
+
+    __preprint_hal_send() {
+        local file="$1" meta="$2" title="$3" author="$4" abstract="$5" category="${6:-info}"
+        local user pass token sword_url
+        user="${HAL_USER:-$(__preprint_get_conf hal user)}"
+        pass="${HAL_PASS:-$(__preprint_get_conf hal pass)}"
+        token="${HAL_TOKEN:-$(__preprint_get_conf hal token)}"
+        sword_url="$(__preprint_hal_sword_url)"
+
+        local auth_args=()
+        if [[ -n "$token" ]]; then
+            auth_args=(-H "Authorization: Bearer $token")
+        elif [[ -n "$user" && -n "$pass" ]]; then
+            auth_args=(-u "${user}:${pass}")
+        else
+            __log "HAL credentials missing. Run: preprint database set hal --user <user> --pass <pass>" -t error -l preprint
+            return 1
+        fi
+
+        local content_type="application/zip"
+        local packaging="http://purl.org/net/sword-types/AOfr"
+        local tmp_dir="" upload_file="$file"
+
+        if [[ "$file" == *.xml ]]; then
+            content_type="text/xml"
+            packaging="http://purl.org/net/sword-types/AOfr-tei"
+        elif [[ "$file" != *.zip ]]; then
+            tmp_dir="$(mktemp -d)"
+            upload_file="$tmp_dir/hal_deposit.zip"
+            local pdf_name
+            pdf_name="$(basename "$file")"
+            cp "$file" "$tmp_dir/$pdf_name"
+
+            if [[ -n "$meta" && -f "$meta" ]]; then
+                cp "$meta" "$tmp_dir/meta.xml"
+            else
+                [[ -z "$title" ]] && title="$(basename "${file%.*}")"
+                [[ -z "$author" ]] && author="${USER:-Anonymous}"
+                [[ -z "$abstract" ]] && abstract="Preprint uploaded via omni preprint tool."
+
+                local esc_title esc_abs esc_dom esc_pdf authors_xml=""
+                esc_title=$(__preprint_xml_escape "$title")
+                esc_abs=$(__preprint_xml_escape "$abstract")
+                esc_dom=$(__preprint_xml_escape "$category")
+                esc_pdf=$(__preprint_xml_escape "$pdf_name")
+
+                local IFS=';' a
+                for a in $author; do
+                    a="${a#"${a%%[![:space:]]*}"}"
+                    a="${a%"${a##*[![:space:]]}"}"
+                    [[ -z "$a" ]] && continue
+                    local first="" last="$a"
+                    if [[ "$a" == *" "* ]]; then
+                        first="${a% *}"
+                        last="${a##* }"
+                    fi
+                    authors_xml+="              <author role=\"aut\"><persName><forename>$(__preprint_xml_escape "$first")</forename><surname>$(__preprint_xml_escape "$last")</surname></persName></author>"$'\n'
+                done
+
+                cat > "$tmp_dir/meta.xml" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<TEI xmlns="http://www.tei-c.org/ns/1.0" xmlns:hal="http://hal.archives-ouvertes.fr/">
+  <text>
+    <body>
+      <listBibl>
+        <biblFull>
+          <editionStmt>
+            <edition>
+              <ref type="file" target="${esc_pdf}" subtype="author" n="1"/>
+            </edition>
+          </editionStmt>
+          <sourceDesc>
+            <biblStruct>
+              <analytic>
+                <title xml:lang="en">${esc_title}</title>
+${authors_xml%$'\n'}
+              </analytic>
+            </biblStruct>
+          </sourceDesc>
+          <profileDesc>
+            <langUsage><language ident="en"/></langUsage>
+            <textClass>
+              <classCode scheme="halDomain" n="${esc_dom}"/>
+              <classCode scheme="halTypology" n="UNDEFINED"/>
+            </textClass>
+            <abstract xml:lang="en">${esc_abs}</abstract>
+          </profileDesc>
+        </biblFull>
+      </listBibl>
+    </body>
+  </text>
+</TEI>
+EOF
+            fi
+            (cd "$tmp_dir" && zip -qr "$upload_file" "$pdf_name" "meta.xml")
+        fi
+
+        __log "Submitting '$upload_file' to HAL SWORD API ($sword_url)..." -t info -l preprint
+        local resp http_code
+        resp=$(curl -sS -w "\n%{http_code}" "${auth_args[@]}" \
+            -H "Content-Type: ${content_type}" \
+            -H "Content-Disposition: attachment; filename=$(basename "$upload_file")" \
+            -H "Packaging: ${packaging}" \
+            --data-binary @"$upload_file" \
+            "$sword_url" 2>&1)
+
+        [[ -n "$tmp_dir" ]] && rm -rf "$tmp_dir"
+        http_code="${resp##*$'\n'}"
+        local body="${resp%$'\n'*}"
+
+        if [[ "$http_code" =~ ^20[012]$ ]]; then
+            __log "HAL deposit succeeded (HTTP $http_code)." -t success -l preprint
+            echo "$body"
+        else
+            __log "HAL deposit failed (HTTP $http_code)." -t error -l preprint
+            echo "$body" >&2
+            return 1
+        fi
+    }
+
+    # =========================================================================
+    # 4. ORCID IMPLEMENTATION (Profile Works via REST API v3.0 & awk)
+    # =========================================================================
+    __preprint_orcid_base_url() {
+        local sb
+        sb="$(__preprint_get_conf orcid sandbox)"
+        if [[ "$sb" == "true" || "${ORCID_SANDBOX:-0}" == "1" ]]; then
+            echo "https://pub.sandbox.orcid.org/v3.0"
+        else
+            echo "https://pub.orcid.org/v3.0"
+        fi
+    }
+
+    __preprint_orcid_api_url() {
+        local sb
+        sb="$(__preprint_get_conf orcid sandbox)"
+        if [[ "$sb" == "true" || "${ORCID_SANDBOX:-0}" == "1" ]]; then
+            echo "https://api.sandbox.orcid.org/v3.0"
+        else
+            echo "https://api.orcid.org/v3.0"
+        fi
+    }
+
+    __preprint_orcid_list() {
+        local max="${1:-0}" sort_by="${2:-time}" reverse="${3:-0}"
+        local orcid token base_url auth_header=(-H "Accept: application/vnd.orcid+xml")
+        orcid="${ORCID_ID:-$(__preprint_get_conf orcid orcid)}"
+        [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid profile)"
+        token="${ORCID_TOKEN:-$(__preprint_get_conf orcid token)}"
+        base_url="$(__preprint_orcid_base_url)"
+
+        if [[ -z "$orcid" ]]; then
+            __log "ORCID iD required. Run: preprint database set orcid --orcid <0000-0000-0000-0000>" -t error -l preprint
+            return 1
+        fi
+        [[ -n "$token" ]] && auth_header+=(-H "Authorization: Bearer $token")
+
+        local owner_name="${ORCID_AUTHOR_NAME:-}"
+        if [[ -z "$owner_name" ]]; then
+            owner_name=$(curl -sSL "${auth_header[@]}" "${base_url}/${orcid}/person" 2>/dev/null | LC_ALL=C awk '
+                function strip_tag(s) { gsub(/<[^>]+>/, "", s); gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s); return s }
+                /<personal-details:given-names>/  { gn = strip_tag($0) }
+                /<personal-details:family-names>/ { fn = strip_tag($0) }
+                /<personal-details:credit-name>/  { cn = strip_tag($0) }
+                END {
+                    if (cn != "") print cn
+                    else if (gn != "" || fn != "") print gn (gn && fn ? " " : "") fn
+                }
+            ')
+        fi
+        [[ -z "$owner_name" ]] && owner_name="$orcid"
+
+        curl -sSL "${auth_header[@]}" "${base_url}/${orcid}/works" | LC_ALL=C awk -v max="$max" -v owner="$owner_name" '
+            function strip_tag(s) {
+                gsub(/<[^>]+>/, "", s)
+                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s)
+                return s
+            }
+            BEGIN { in_sum = 0; count = 0 }
+            /<work:work-summary/ {
+                in_sum = 1
+                put_code = ""; title = ""; year = "0000"; month = "01"; day = "01"; in_pub = 0
+                if (match($0, /put-code="[0-9]+"/)) {
+                    put_code = substr($0, RSTART + 10, RLENGTH - 11)
+                }
+                next
+            }
+            /<\/work:work-summary>/ {
+                in_sum = 0
+                count++
+                date_str = (year == "0000" ? "N/A" : year "-" month "-" day)
+                printf "[%s] (%s) %s — %s\n", put_code, date_str, (title ? title : "Untitled"), owner
+                if (max > 0 && count >= max) exit 0
+                next
+            }
+            in_sum {
+                if ($0 ~ /<common:title>/) title = strip_tag($0)
+                if ($0 ~ /<common:publication-date>/) in_pub = 1
+                if ($0 ~ /<\/common:publication-date>/) in_pub = 0
+                if (in_pub && $0 ~ /<common:year>/)  year = strip_tag($0)
+                if (in_pub && $0 ~ /<common:month>/) month = strip_tag($0)
+                if (in_pub && $0 ~ /<common:day>/)   day = strip_tag($0)
+            }
+            END {
+                if (count == 0) print "No works found for this ORCID profile."
+            }
+        '
+    }
+
+    __preprint_orcid_get() {
+        local target="$1"
+        local orcid token base_url auth_header=(-H "Accept: application/vnd.orcid+xml")
+        orcid="${ORCID_ID:-$(__preprint_get_conf orcid orcid)}"
+        [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid profile)"
+        token="${ORCID_TOKEN:-$(__preprint_get_conf orcid token)}"
+        base_url="$(__preprint_orcid_base_url)"
+        [[ -n "$token" ]] && auth_header+=(-H "Authorization: Bearer $token")
+
+        local put_code="$target"
+        if [[ "$target" == *":"* ]]; then
+            orcid="${target%%:*}"
+            put_code="${target#*:}"
+        fi
+
+        if [[ -z "$orcid" ]]; then
+            __log "ORCID iD required (configure via 'preprint database set orcid --orcid <id>' or pass '<orcid>:<put-code>')." -t error -l preprint
+            return 1
+        fi
+
+        curl -sSL "${auth_header[@]}" "${base_url}/${orcid}/work/${put_code}" | LC_ALL=C awk '
+            function strip_tag(s) {
+                gsub(/<[^>]+>/, "", s)
+                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s)
+                return s
+            }
+            BEGIN { put_code = ""; title = ""; authors = ""; journal = "N/A"; wtype = "N/A"; year = "N/A"; url = "N/A"; desc = ""; eids = "" }
+            /<work:work / {
+                if (match($0, /put-code="[0-9]+"/)) put_code = substr($0, RSTART + 10, RLENGTH - 11)
+            }
+            /<common:title>/           { if (title == "") title = strip_tag($0) }
+            /<work:credit-name>/       { a = strip_tag($0); authors = (authors == "" ? a : authors ", " a) }
+            /<work:journal-title>/     { journal = strip_tag($0) }
+            /<work:type>/              { wtype = strip_tag($0) }
+            /<work:short-description>/ { desc = strip_tag($0) }
+            /<common:year>/            { if (year == "N/A") year = strip_tag($0) }
+            /<work:url>/               { url = strip_tag($0) }
+            /<common:external-id-type>/  { cur_etype = strip_tag($0) }
+            /<common:external-id-value>/ {
+                cur_eval = strip_tag($0)
+                if (cur_etype != "") {
+                    eids = (eids == "" ? cur_etype ":" cur_eval : eids ", " cur_etype ":" cur_eval)
+                    cur_etype = ""
+                }
+            }
+            END {
+                if (put_code == "" && title == "") {
+                    print "Error: Work not found." > "/dev/stderr"
+                    exit 1
+                }
+                printf "Put-Code:    %s\nTitle:       %s\nAuthors:     %s\nJournal:     %s\nType:        %s\nYear:        %s\nIDs:         %s\nURL:         %s\nDescription:\n  %s\n", put_code, title, (authors ? authors : "N/A"), journal, wtype, year, eids, url, desc
+            }
+        '
+    }
+
+    __preprint_orcid_search() {
+        local term="$1" rows="${2:-50}" start="${3:-0}" sort_by="${4:-time}" reverse="${5:-0}"
+        local base_url enc_term
+        base_url="$(__preprint_orcid_base_url)"
+        enc_term=$(__preprint_urlencode "$term")
+
+        curl -sSL -H "Accept: application/vnd.orcid+xml" "${base_url}/expanded-search/?q=${enc_term}&start=${start}&rows=${rows}" | LC_ALL=C awk '
+            function strip_tag(s) {
+                gsub(/<[^>]+>/, "", s)
+                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s)
+                return s
+            }
+            BEGIN { in_res = 0; count = 0 }
+            /<expanded-search:expanded-result>/ {
+                in_res = 1; oid = ""; gn = ""; fn = ""; inst = ""
+                next
+            }
+            /<\/expanded-search:expanded-result>/ {
+                in_res = 0; count++
+                author_full = gn (gn && fn ? " " : "") fn
+                if (author_full == "") author_full = "Unknown Researcher"
+                printf "[%s] (ORCID) %s — %s\n", oid, (inst ? inst : "ORCID Profile"), author_full
+                next
+            }
+            in_res {
+                if ($0 ~ /<expanded-search:orcid-id>/)         oid = strip_tag($0)
+                if ($0 ~ /<expanded-search:given-names>/)      gn = strip_tag($0)
+                if ($0 ~ /<expanded-search:family-names>/)     fn = strip_tag($0)
+                if ($0 ~ /<expanded-search:institution-name>/) {
+                    v = strip_tag($0)
+                    inst = (inst == "" ? v : inst ", " v)
+                }
+            }
+            END {
+                if (count == 0) exit 1
+            }
+        ' || echo "No ORCID records found."
+    }
+
+    __preprint_orcid_send() {
+        local file="$1" meta="$2" title="$3" author="$4" abstract="$5"
+        local work_type="${6:-preprint}" pub_date="$7" journal="$8" url="$9" doi="${10}" arxiv_id="${11}" hal_id="${12}"
+
+        local orcid token api_url
+        orcid="${ORCID_ID:-$(__preprint_get_conf orcid orcid)}"
+        [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid profile)"
+        token="${ORCID_TOKEN:-$(__preprint_get_conf orcid token)}"
+        api_url="$(__preprint_orcid_api_url)"
+
+        if [[ -z "$orcid" || -z "$token" ]]; then
+            __log "ORCID iD and OAuth token required. Run: preprint database set orcid --orcid <ID> --token <TOKEN>" -t error -l preprint
+            return 1
+        fi
+
+        local content_type="application/vnd.orcid+json"
+        local payload=""
+
+        local meta_source=""
+        if [[ -n "$meta" && -f "$meta" ]]; then
+            meta_source="$meta"
+        elif [[ -n "$file" && ( "$file" == *.json || "$file" == *.xml ) ]]; then
+            meta_source="$file"
+        fi
+
+        if [[ -n "$meta_source" ]]; then
+            [[ "$meta_source" == *.xml ]] && content_type="application/vnd.orcid+xml"
+            payload=$(<"$meta_source")
+        else
+            [[ -z "$title" && -n "$file" ]] && title="$(basename "${file%.*}")"
+            if [[ -z "$title" ]]; then
+                __log "ORCID requires a title (-t/--title) when not passing a JSON/XML metadata file." -t error -l preprint
+                return 1
+            fi
+            if [[ -z "$doi" && -z "$arxiv_id" && -z "$hal_id" && -z "$url" ]]; then
+                __log "ORCID requires at least one external identifier (--doi, --arxiv, --hal, or --url)." -t error -l preprint
+                return 1
+            fi
+
+            [[ -z "$pub_date" ]] && printf -v pub_date "%(%Y-%m-%d)T" -1
+            local yr="${pub_date%%-*}" rest="${pub_date#*-}" mo="" dy=""
+            if [[ "$rest" != "$pub_date" ]]; then
+                mo="${rest%%-*}"
+                [[ "${#mo}" -eq 1 ]] && mo="0${mo}"
+                if [[ "$rest" == *-* ]]; then
+                    dy="${rest#*-}"
+                    [[ "${#dy}" -eq 1 ]] && dy="0${dy}"
+                fi
+            fi
+
+            local pub_date_json="{\"year\":{\"value\":\"${yr}\"}"
+            [[ -n "$mo" ]] && pub_date_json+=",\"month\":{\"value\":\"${mo}\"}"
+            [[ -n "$dy" ]] && pub_date_json+=",\"day\":{\"value\":\"${dy}\"}"
+            pub_date_json+="}"
+
+            local ext_ids=""
+            if [[ -n "$doi" ]]; then
+                local edoi=$(__preprint_json_escape "$doi")
+                ext_ids+="${ext_ids:+,}{\"external-id-type\":\"doi\",\"external-id-value\":\"${edoi}\",\"external-id-url\":{\"value\":\"https://doi.org/${edoi}\"},\"external-id-relationship\":\"self\"}"
+            fi
+            if [[ -n "$arxiv_id" ]]; then
+                local earx=$(__preprint_json_escape "$arxiv_id")
+                ext_ids+="${ext_ids:+,}{\"external-id-type\":\"arxiv\",\"external-id-value\":\"${earx}\",\"external-id-url\":{\"value\":\"https://arxiv.org/abs/${earx}\"},\"external-id-relationship\":\"self\"}"
+            fi
+            if [[ -n "$hal_id" ]]; then
+                local ehal=$(__preprint_json_escape "$hal_id")
+                ext_ids+="${ext_ids:+,}{\"external-id-type\":\"hal\",\"external-id-value\":\"${ehal}\",\"external-id-url\":{\"value\":\"https://hal.science/${ehal}\"},\"external-id-relationship\":\"self\"}"
+            fi
+            if [[ -z "$ext_ids" && -n "$url" ]]; then
+                local eurl=$(__preprint_json_escape "$url")
+                ext_ids+="{\"external-id-type\":\"uri\",\"external-id-value\":\"${eurl}\",\"external-id-url\":{\"value\":\"${eurl}\"},\"external-id-relationship\":\"self\"}"
+            fi
+
+            local esc_title=$(__preprint_json_escape "$title")
+            local esc_wtype=$(__preprint_json_escape "${work_type:-preprint}")
+            payload="{\"title\":{\"title\":{\"value\":\"${esc_title}\"}},\"type\":\"${esc_wtype}\",\"publication-date\":${pub_date_json},\"external-ids\":{\"external-id\":[${ext_ids}]}"
+
+            if [[ -n "$abstract" ]]; then
+                payload+=",\"short-description\":\"$(__preprint_json_escape "$abstract")\""
+            fi
+            if [[ -n "$journal" ]]; then
+                payload+=",\"journal-title\":{\"value\":\"$(__preprint_json_escape "$journal")\"}"
+            fi
+            if [[ -n "$url" ]]; then
+                payload+=",\"url\":{\"value\":\"$(__preprint_json_escape "$url")\"}"
+            fi
+            if [[ -n "$author" ]]; then
+                local contribs="" idx=0 IFS=';' a
+                for a in $author; do
+                    a="${a#"${a%%[![:space:]]*}"}"
+                    a="${a%"${a##*[![:space:]]}"}"
+                    [[ -z "$a" ]] && continue
+                    local seq="additional"
+                    (( idx == 0 )) && seq="first"
+                    contribs+="${contribs:+,}{\"credit-name\":{\"value\":\"$(__preprint_json_escape "$a")\"},\"contributor-attributes\":{\"contributor-sequence\":\"${seq}\",\"contributor-role\":\"author\"}}"
+                    ((idx++))
+                done
+                [[ -n "$contribs" ]] && payload+=",\"contributors\":{\"contributor\":[${contribs}]}"
+            fi
+            payload+="}"
+        fi
+
+        __log "Posting work '$title' to ORCID ($orcid)..." -t info -l preprint
+        local resp http_code
+        resp=$(curl -sS -w "\n%{http_code}" -X POST "${api_url}/${orcid}/work" \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: ${content_type}" \
+            -H "Accept: application/json" \
+            -d "$payload" 2>&1)
+
+        http_code="${resp##*$'\n'}"
+        local body="${resp%$'\n'*}"
+
+        if [[ "$http_code" =~ ^20[012]$ ]]; then
+            __log "Work successfully added to ORCID ($orcid)!" -t success -l preprint
+        else
+            __log "ORCID submission failed (HTTP $http_code)." -t error -l preprint
+            echo "$body" >&2
+            return 1
+        fi
+    }
+}

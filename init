@@ -1,0 +1,170 @@
+#! /bin/bash
+
+_PREPRINT_DIR_RAW="${BASH_SOURCE[0]%/*}"
+[[ "$_PREPRINT_DIR_RAW" == "${BASH_SOURCE[0]}" ]] && _PREPRINT_DIR_RAW="."
+_PREPRINT_DIR="$(cd "$_PREPRINT_DIR_RAW" && pwd)"
+
+__preprint__() {
+    __load script helper --from "$_PREPRINT_DIR/mods"
+
+    __preprint__.__help__() {
+        cat <<'EOF' >&2
+ABOUT:
+    omni academic preprint & publication manager (arXiv, Zenodo, HAL, ORCID)
+
+USAGE:
+    preprint database <ls|set|rm> [<database>] [options]
+    preprint list [entries] <database> [-s/--sort <time|alpha>] [-r/--reverse] [-n/--max <N>]
+    preprint get [<id>] -d/--database <database> [-D/--download] [-o/--output <path>] [-s/--sort <time|alpha>] [-r/--reverse]
+    preprint search <term> -d/--database <database> [-D/--download] [-o/--output <path>] [-s/--sort <time|alpha>] [-r/--reverse] [-n/--max <page_size>] [--no-fzf]
+    preprint download [<id>] -d/--database <database> [-o/--output <path>]
+    preprint send [<file>] -d/--database <database> [options]
+
+DATABASES:
+    arxiv, zenodo, hal, orcid
+
+DOWNLOADING PDFS:
+    - Inside fzf ('search' or 'get'): Press Ctrl-D to immediately download the highlighted entry's PDF,
+      or press Enter to view details and confirm download.
+    - CLI Flags: Pass -D/--download (and optionally -o/--output <dir_or_file>) to 'search' or 'get'.
+
+SORTING OPTIONS (for 'list', 'get', 'search'):
+    -s, --sort <criteria>   Sort by 'time' (default: newest first) or 'alpha' / 'alphabetically' (A-Z)
+    -r, --reverse           Reverse the sort order (oldest first for 'time', Z-A for 'alpha')
+
+DATABASE COMMANDS:
+    database ls                        List registered databases and status
+    database set <database> [options]  Configure profile & credentials for a database
+    database rm <database>             Remove configuration for a database
+
+OPTIONS (for 'database set <database>'):
+    --profile <id>          Profile ID (arXiv Author ID e.g. 'martins_y_1', HAL idHAL, or ORCID iD)
+    --orcid <id>            ORCID iD (e.g., 0000-0002-1825-0097; works for ORCID, arXiv & HAL profiles)
+    --token <token>         API Token / OAuth Bearer token (Zenodo, ORCID, arXiv, HAL)
+    --user <user>           Account username/email (arXiv, HAL)
+    --pass <pass>           Account password (arXiv, HAL)
+    --sandbox               Use sandbox/preprod API endpoints
+    --no-sandbox            Use production API endpoints (default)
+
+OPTIONS (for 'send'):
+    -d, --database <db>     Target database (arxiv, zenodo, hal, orcid)
+    -m, --meta <file>       Custom metadata file (JSON/XML) instead of CLI flags
+    -t, --title <title>     Title of the paper/work
+    -a, --author <authors>  Authors separated by ';' (e.g., "John Doe; Jane Smith")
+    -A, --abstract <text>   Abstract or short description
+    -c, --category <cat>    Domain/Category (e.g., "cs.AI" for arXiv, "info.info-ai" for HAL)
+    --doi <doi>             DOI identifier (for ORCID / Zenodo / HAL)
+    --arxiv <id>            arXiv ID (for ORCID external-id)
+    --hal <id>              HAL ID (for ORCID external-id)
+    --url <url>             Work URL (for ORCID)
+    --journal <name>        Journal or host venue title (for ORCID)
+    --type <type>           Work type (default: "preprint"; e.g., "journal-article")
+    --date <YYYY[-MM[-DD]]> Publication date (default: today)
+    --publish               Immediately publish deposit (Zenodo)
+EOF
+    }
+
+    preprint() {
+        local cmd="${1:-}"
+        if [[ -z "$cmd" || "$cmd" == "-h" || "$cmd" == "--help" ]]; then
+            __preprint__.__help__
+            return 0
+        fi
+        shift
+
+        case "$cmd" in
+            database|db)
+                __preprint_database "$@"
+                ;;
+            list|ls)
+                __preprint_list "$@"
+                ;;
+            get)
+                __preprint_get "$@"
+                ;;
+            search)
+                __preprint_search "$@"
+                ;;
+            download|dl)
+                __preprint_get -D "$@"
+                ;;
+            send|push|publish)
+                __preprint_send "$@"
+                ;;
+            *)
+                __log "Unknown command '$cmd'. Try 'preprint --help'." -t error -l preprint
+                return 1
+                ;;
+        esac
+    }
+
+    __preprint__.__compl__() {
+        local cur="${COMP_WORDS[COMP_CWORD]:-}"
+        local prev="${COMP_WORDS[COMP_CWORD-1]:-}"
+        local cmd="${COMP_WORDS[1]:-}"
+        local subcmd="${COMP_WORDS[2]:-}"
+        local dbs="arxiv zenodo hal orcid"
+
+        if [[ $COMP_CWORD -eq 1 ]]; then
+            COMPREPLY=( $(compgen -W "database list get search download send --help -h" -- "$cur") )
+            return 0
+        fi
+
+        if [[ "$prev" == "-d" || "$prev" == "--database" ]]; then
+            COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
+            return 0
+        fi
+
+        if [[ "$prev" == "-s" || "$prev" == "--sort" ]]; then
+            COMPREPLY=( $(compgen -W "time alpha alphabetically" -- "$cur") )
+            return 0
+        fi
+
+        if [[ "$prev" == "-m" || "$prev" == "--meta" || "$prev" == "-o" || "$prev" == "--output" ]]; then
+            COMPREPLY=( $(compgen -f -- "$cur") )
+            return 0
+        fi
+
+        case "$cmd" in
+            database|db)
+                if [[ $COMP_CWORD -eq 2 ]]; then
+                    COMPREPLY=( $(compgen -W "ls set rm" -- "$cur") )
+                elif [[ $COMP_CWORD -eq 3 && ( "$subcmd" == "set" || "$subcmd" == "rm" ) ]]; then
+                    COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
+                elif [[ "$cur" == -* ]]; then
+                    COMPREPLY=( $(compgen -W "--profile --orcid --token --user --pass --sandbox --no-sandbox" -- "$cur") )
+                fi
+                ;;
+            list|ls)
+                if [[ $COMP_CWORD -eq 2 && "$cur" != -* ]]; then
+                    COMPREPLY=( $(compgen -W "entries $dbs" -- "$cur") )
+                elif [[ $COMP_CWORD -eq 3 && "$subcmd" == "entries" && "$cur" != -* ]]; then
+                    COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
+                elif [[ "$cur" == -* ]]; then
+                    COMPREPLY=( $(compgen -W "-s --sort -r --reverse -n --max" -- "$cur") )
+                fi
+                ;;
+            get|download|dl)
+                if [[ "$cur" == -* ]]; then
+                    COMPREPLY=( $(compgen -W "-d --database -D --download -o --output -s --sort -r --reverse -n --max" -- "$cur") )
+                fi
+                ;;
+            search)
+                if [[ "$cur" == -* ]]; then
+                    COMPREPLY=( $(compgen -W "-d --database -D --download -o --output -s --sort -r --reverse -n --max -l --no-fzf" -- "$cur") )
+                fi
+                ;;
+            send|push|publish)
+                if [[ "$cur" == -* ]]; then
+                    COMPREPLY=( $(compgen -W "-d --database -m --meta -t --title -a --author -A --abstract -c --category --doi --arxiv --hal --url --journal --type --date --publish" -- "$cur") )
+                else
+                    COMPREPLY=( $(compgen -f -- "$cur") )
+                fi
+                ;;
+        esac
+    }
+
+    __preprint__.__init__() {
+        __compl preprint
+    }
+}
