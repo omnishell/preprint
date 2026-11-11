@@ -6,22 +6,26 @@ _PREPRINT_DIR="$(cd "$_PREPRINT_DIR_RAW" && pwd)"
 
 __preprint__() {
     __load script helper --from "$_PREPRINT_DIR/mods"
+    __load script "*" --from "$_PREPRINT_DIR/mods/providers.d"
 
     __preprint__.__help__() {
-        cat <<'EOF' >&2
+        local dbs_csv
+        dbs_csv="$(__preprint_providers_csv)"
+        cat <<EOF >&2
 ABOUT:
-    omni academic preprint & publication manager (arXiv, Zenodo, HAL, ORCID, Hexagon Math)
+    omni academic preprint & publication manager
 
 USAGE:
-    preprint database <ls|set|rm> [<database>] [options]
-    preprint list [entries] <database> [-s/--sort <time|alpha>] [-r/--reverse] [-n/--max <N>]
-    preprint get [<id>] -d/--database <database> [-D/--download] [-o/--output <path>] [-s/--sort <time|alpha>] [-r/--reverse]
-    preprint search <term> -d/--database <database> [-D/--download] [-o/--output <path>] [-s/--sort <time|alpha>] [-r/--reverse] [-n/--max <page_size>] [--no-fzf]
-    preprint download [<id>] -d/--database <database> [-o/--output <path>]
-    preprint send [<file>] -d/--database <database> [options]
+    preprint database <ls|set|rm> [-d/--database <provider>] [options]
+    preprint list -d/--database <provider> [-s/--sort <time|alpha>] [-r/--reverse] [-n/--max <N>]
+    preprint get [<id>] -d/--database <provider> [-D/--download] [-o/--output <path>] [-s/--sort <time|alpha>] [-r/--reverse]
+    preprint search <term> -d/--database <provider> [-D/--download] [-o/--output <path>] [-s/--sort <time|alpha>] [-r/--reverse] [-n/--max <page_size>] [--no-fzf]
+    preprint download [<id>] -d/--database <provider> [-o/--output <path>]
+    preprint send [<file>] -d/--database <provider> [options]
 
-DATABASES:
-    arxiv, zenodo, hal, orcid, hexagon
+REGISTERED PROVIDERS:
+    ${dbs_csv}
+$(__preprint_providers_help_table)
 
 DOWNLOADING PDFS:
     - Inside fzf ('search' or 'get'): Press Ctrl-D to immediately download the highlighted entry's PDF,
@@ -33,35 +37,37 @@ SORTING OPTIONS (for 'list', 'get', 'search'):
     -r, --reverse           Reverse the sort order (oldest first for 'time', Z-A for 'alpha')
 
 DATABASE COMMANDS:
-    database ls                        List registered databases and status
-    database set <database> [options]  Configure profile & credentials for a database
-    database rm <database>             Remove configuration for a database
+    database ls                                List registered providers and status
+    database set -d <provider> [options]       Configure profile & credentials for a provider
+    database rm -d <provider>                  Remove configuration for a provider
 
-OPTIONS (for 'database set <database>'):
-    --profile <id>          Profile ID (arXiv Author ID, HAL idHAL, ORCID iD, or Hexagon User ID e.g. 'user_...')
-    --orcid <id>            ORCID iD (e.g., 0000-0002-1825-0097; works for ORCID, arXiv, HAL & Hexagon profiles)
-    --token <token>         API Token / OAuth Bearer token (Zenodo, ORCID, arXiv, HAL, Hexagon)
-    --user <user>           Account username/email (arXiv, HAL, Hexagon)
-    --pass <pass>           Account password (arXiv, HAL, Hexagon)
+OPTIONS (for 'database set'):
+    -d, --database <prov>   Target provider (${dbs_csv})
+    --profile <id>          Profile ID (Author ID, idHAL, ORCID iD, or User ID)
+    --orcid <id>            ORCID iD (e.g., 0000-0002-1825-0097)
+    --token <token>         API Token / OAuth Bearer token
+    --user <user>           Account username/email
+    --pass <pass>           Account password
     --sandbox               Use sandbox/preprod API endpoints
     --no-sandbox            Use production API endpoints (default)
 
 OPTIONS (for 'send'):
-    -d, --database <db>     Target database (arxiv, zenodo, hal, orcid, hexagon)
+    -d, --database <prov>   Target provider (${dbs_csv})
     -m, --meta <file>       Custom metadata file (JSON/XML) instead of CLI flags
     -t, --title <title>     Title of the paper/work
     -a, --author <authors>  Authors separated by ';' (e.g., "John Doe; Jane Smith")
     -A, --abstract <text>   Abstract or short description
-    -c, --category <cat>    Domain/Category (e.g., "math.NT" for Hexagon/arXiv, "info.info-ai" for HAL)
-    --doi <doi>             DOI identifier (for ORCID / Zenodo / HAL)
-    --arxiv <id>            arXiv ID (for ORCID external-id)
-    --hal <id>              HAL ID (for ORCID external-id)
-    --hexagon <id>          Hexagon ID (e.g., 2610.00244v1; for ORCID external-id)
-    --url <url>             Work URL (for ORCID)
-    --journal <name>        Journal or host venue title (for ORCID)
+    -c, --category <cat>    Domain/Category (e.g., "math.NT", "cs.AI", "info.info-ai")
+    --id <provider:id>      External identifier (repeatable, e.g., --id arxiv:2301.00001 --id hexagon:2610.00244v1)
+    --doi <doi>             DOI identifier
+    --arxiv <id>            arXiv ID
+    --hal <id>              HAL ID
+    --hexagon <id>          Hexagon Math ID
+    --url <url>             Work URL
+    --journal <name>        Journal or host venue title
     --type <type>           Work type (default: "preprint"; e.g., "journal-article")
     --date <YYYY[-MM[-DD]]> Publication date (default: today)
-    --publish               Immediately publish deposit (Zenodo / Hexagon)
+    --publish               Immediately publish deposit
 EOF
     }
 
@@ -104,7 +110,7 @@ EOF
         local prev="${COMP_WORDS[COMP_CWORD-1]:-}"
         local cmd="${COMP_WORDS[1]:-}"
         local subcmd="${COMP_WORDS[2]:-}"
-        local dbs="arxiv zenodo hal orcid hexagon"
+        local dbs="${PREPRINT_PROVIDERS[*]}"
 
         if [[ $COMP_CWORD -eq 1 ]]; then
             COMPREPLY=( $(compgen -W "database list get search download send --help -h" -- "$cur") )
@@ -126,23 +132,28 @@ EOF
             return 0
         fi
 
+        local ext_id_flags="" p
+        for p in "${PREPRINT_PROVIDERS[@]}"; do
+            ext_id_flags+=" --${p}"
+        done
+
         case "$cmd" in
             database|db)
                 if [[ $COMP_CWORD -eq 2 ]]; then
                     COMPREPLY=( $(compgen -W "ls set rm" -- "$cur") )
+                elif [[ "$cur" == -* ]]; then
+                    if [[ "$subcmd" == "set" ]]; then
+                        COMPREPLY=( $(compgen -W "-d --database --profile --orcid --token --user --pass --sandbox --no-sandbox" -- "$cur") )
+                    elif [[ "$subcmd" == "rm" ]]; then
+                        COMPREPLY=( $(compgen -W "-d --database" -- "$cur") )
+                    fi
                 elif [[ $COMP_CWORD -eq 3 && ( "$subcmd" == "set" || "$subcmd" == "rm" ) ]]; then
                     COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
-                elif [[ "$cur" == -* ]]; then
-                    COMPREPLY=( $(compgen -W "--profile --orcid --token --user --pass --sandbox --no-sandbox" -- "$cur") )
                 fi
                 ;;
             list|ls)
-                if [[ $COMP_CWORD -eq 2 && "$cur" != -* ]]; then
-                    COMPREPLY=( $(compgen -W "entries $dbs" -- "$cur") )
-                elif [[ $COMP_CWORD -eq 3 && "$subcmd" == "entries" && "$cur" != -* ]]; then
-                    COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
-                elif [[ "$cur" == -* ]]; then
-                    COMPREPLY=( $(compgen -W "-s --sort -r --reverse -n --max" -- "$cur") )
+                if [[ "$cur" == -* ]]; then
+                    COMPREPLY=( $(compgen -W "-d --database -s --sort -r --reverse -n --max" -- "$cur") )
                 fi
                 ;;
             get|download|dl)
@@ -157,7 +168,7 @@ EOF
                 ;;
             send|push|publish)
                 if [[ "$cur" == -* ]]; then
-                    COMPREPLY=( $(compgen -W "-d --database -m --meta -t --title -a --author -A --abstract -c --category --doi --arxiv --hal --hexagon --url --journal --type --date --publish" -- "$cur") )
+                    COMPREPLY=( $(compgen -W "-d --database -m --meta -t --title -a --author -A --abstract -c --category --id --doi --url --journal --type --date --publish $ext_id_flags" -- "$cur") )
                 else
                     COMPREPLY=( $(compgen -f -- "$cur") )
                 fi

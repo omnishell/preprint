@@ -1,0 +1,426 @@
+#! /bin/bash
+
+__orcid__() {
+    __preprint_register_provider "orcid" \
+        --pagination "offset" \
+        --requires-file "false" \
+        --desc "ORCID Researcher Registry (v3.0 Public & Member API)"
+
+    __preprint_orcid_base_url() {
+        local sb
+        sb="$(__preprint_get_conf orcid sandbox)"
+        if [[ "$sb" == "true" || "${ORCID_SANDBOX:-0}" == "1" ]]; then
+            echo "https://pub.sandbox.orcid.org/v3.0"
+        else
+            echo "https://pub.orcid.org/v3.0"
+        fi
+    }
+
+    __preprint_orcid_api_url() {
+        local sb
+        sb="$(__preprint_get_conf orcid sandbox)"
+        if [[ "$sb" == "true" || "${ORCID_SANDBOX:-0}" == "1" ]]; then
+            echo "https://api.sandbox.orcid.org/v3.0"
+        else
+            echo "https://api.orcid.org/v3.0"
+        fi
+    }
+
+    __preprint_provider_orcid_download() {
+        local id="$1" out_path="${2:-}"
+        local orcid token base_url auth_header=(-H "Accept: application/vnd.orcid+xml")
+        orcid="${ORCID_ID:-$(__preprint_get_conf orcid orcid)}"
+        [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid profile)"
+        token="${ORCID_TOKEN:-$(__preprint_get_conf orcid token)}"
+        base_url="$(__preprint_orcid_base_url)"
+        [[ -n "$token" ]] && auth_header+=(-H "Authorization: Bearer $token")
+
+        local put_code="$id"
+        if [[ "$id" == *":"* ]]; then
+            orcid="${id%%:*}"
+            put_code="${id#*:}"
+        fi
+
+        local xml resolved_type resolved_val
+        xml=$(curl -sSL "${auth_header[@]}" "${base_url}/${orcid}/work/${put_code}" 2>/dev/null)
+        read -r resolved_type resolved_val < <(LC_ALL=C awk '
+            function strip_tag(s) { gsub(/<[^>]+>/, "", s); gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s); return s }
+            /<common:external-id-type>/  { cur_t = strip_tag($0) }
+            /<common:external-id-value>/ {
+                cur_v = strip_tag($0)
+                if (cur_t == "arxiv") { arxiv_id = cur_v }
+                else if (cur_t == "hal") { hal_id = cur_v }
+                else if (cur_t == "doi") { doi_id = cur_v }
+                else if (cur_t == "other-id" || cur_t == "uri") {
+                    if (cur_v ~ /^hexagon:/ || cur_v ~ /hexagonmath\.org\//) {
+                        hex_id = cur_v
+                        sub(/^.*hexagonmath\.org\/(abs\/|pdf\/)?/, "", hex_id)
+                        sub(/^hexagon:/, "", hex_id)
+                    } else if (cur_v ~ /^[a-z0-9_-]+:/) {
+                        ext_prov = cur_v; sub(/:.*$/, "", ext_prov)
+                        ext_val = cur_v; sub(/^[^:]+:/, "", ext_val)
+                    }
+                }
+                cur_t = ""
+            }
+            /<work:url>/ {
+                work_url = strip_tag($0)
+                if (work_url ~ /hexagonmath\.org\// && hex_id == "") {
+                    hex_id = work_url
+                    sub(/^.*hexagonmath\.org\/(abs\/|pdf\/)?/, "", hex_id)
+                }
+            }
+            END {
+                if (arxiv_id != "") print "arxiv", arxiv_id
+                else if (hex_id != "") print "hexagon", hex_id
+                else if (hal_id != "") print "hal", hal_id
+                else if (ext_prov != "") print ext_prov, ext_val
+                else if (work_url ~ /\.pdf$/ || work_url ~ /arxiv\.org\/abs\//) print "url", work_url
+                else if (doi_id ~ /10\.48550\/arXiv\./) {
+                    sub(/^.*arXiv\./, "", doi_id)
+                    print "arxiv", doi_id
+                } else if (work_url != "") print "url", work_url
+            }
+        ' <<< "$xml")
+
+        if __preprint_is_provider "$resolved_type"; then
+            __preprint_download_entry "$resolved_type" "$resolved_val" "$out_path"
+            return $?
+        elif [[ "$resolved_type" == "url" ]]; then
+            local pdf_url="${resolved_val/\/abs\//\/pdf\/}"
+            [[ "$pdf_url" == *arxiv.org/pdf/* && "$pdf_url" != *.pdf ]] && pdf_url="${pdf_url}.pdf"
+            __preprint_save_pdf_stream "$pdf_url" "orcid_${put_code}.pdf" "$out_path"
+            return $?
+        fi
+
+        __log "Could not resolve a direct PDF URL for '$id' in orcid." -t error -l preprint
+        return 1
+    }
+
+    __preprint_provider_orcid_on_select() {
+        local target="$1" selected="$2" key="$3" sort_by="$4" reverse="$5" download="$6" out_path="$7"
+        local author_name=""
+        if [[ "$selected" == *"   "* ]]; then
+            author_name="${selected##*   }"
+        fi
+        local works work_out work_key work_sel put_code
+        works="$(ORCID_ID="$target" ORCID_AUTHOR_NAME="$author_name" __preprint_provider_orcid_list 0 "$sort_by" "$reverse")"
+        if [[ -z "$works" || "$works" == "No "* ]]; then
+            echo "$works"
+            return 0
+        fi
+        works="$(__preprint_sort_lines "$sort_by" "$reverse" <<< "$works")"
+        work_out=$(printf '%s\n' "$works" | fzf --expect=ctrl-d --header="[ID] (Date) Title   Authors  |  Enter: details  |  Ctrl-D: download PDF" --prompt="Works for $target > " --height=50% --layout=reverse --border)
+        [[ -z "$work_out" ]] && return 0
+        work_key="${work_out%%$'\n'*}"
+        work_sel="${work_out#*$'\n'}"
+        [[ "$work_key" == "$work_out" ]] && { work_key=""; work_sel="$work_out"; }
+        [[ -z "$work_sel" ]] && return 0
+        if [[ "$work_sel" =~ ^\[([^]]+)\] ]]; then
+            put_code="${BASH_REMATCH[1]}"
+        else
+            put_code="${work_sel%% *}"
+        fi
+        if [[ "$work_key" == "ctrl-d" ]]; then
+            __preprint_provider_orcid_download "${target}:${put_code}" "$out_path"
+            return $?
+        fi
+        __preprint_provider_orcid_get "${target}:${put_code}"
+        __preprint_prompt_download "orcid" "${target}:${put_code}" "$download" "$out_path"
+    }
+
+    __preprint_provider_orcid_list() {
+        local max="${1:-0}" sort_by="${2:-time}" reverse="${3:-0}"
+        local orcid token base_url auth_header=(-H "Accept: application/vnd.orcid+xml")
+        orcid="${ORCID_ID:-$(__preprint_get_conf orcid orcid)}"
+        [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid profile)"
+        token="${ORCID_TOKEN:-$(__preprint_get_conf orcid token)}"
+        base_url="$(__preprint_orcid_base_url)"
+
+        if [[ -z "$orcid" ]]; then
+            __log "ORCID iD required. Run: preprint database set -d orcid --orcid <0000-0000-0000-0000>" -t error -l preprint
+            return 1
+        fi
+        [[ -n "$token" ]] && auth_header+=(-H "Authorization: Bearer $token")
+
+        local owner_name="${ORCID_AUTHOR_NAME:-}"
+        if [[ -z "$owner_name" ]]; then
+            owner_name=$(curl -sSL "${auth_header[@]}" "${base_url}/${orcid}/person" 2>/dev/null | LC_ALL=C awk '
+                function strip_tag(s) { gsub(/<[^>]+>/, "", s); gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s); return s }
+                /<personal-details:given-names>/  { gn = strip_tag($0) }
+                /<personal-details:family-names>/ { fn = strip_tag($0) }
+                /<personal-details:credit-name>/  { cn = strip_tag($0) }
+                END {
+                    if (cn != "") print cn
+                    else if (gn != "" || fn != "") print gn (gn && fn ? " " : "") fn
+                }
+            ')
+        fi
+        [[ -z "$owner_name" ]] && owner_name="$orcid"
+
+        curl -sSL "${auth_header[@]}" "${base_url}/${orcid}/works" | LC_ALL=C awk -v max="$max" -v owner="$owner_name" '
+            function strip_tag(s) {
+                gsub(/<[^>]+>/, "", s)
+                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s)
+                return s
+            }
+            BEGIN { in_sum = 0; count = 0 }
+            /<work:work-summary/ {
+                in_sum = 1
+                put_code = ""; title = ""; year = "0000"; month = "01"; day = "01"; in_pub = 0
+                if (match($0, /put-code="[0-9]+"/)) {
+                    put_code = substr($0, RSTART + 10, RLENGTH - 11)
+                }
+                next
+            }
+            /<\/work:work-summary>/ {
+                in_sum = 0
+                count++
+                date_str = (year == "0000" ? "N/A" : year "-" month "-" day)
+                printf "[%s] (%s) %s   %s\n", put_code, date_str, (title ? title : "Untitled"), owner
+                if (max > 0 && count >= max) exit 0
+                next
+            }
+            in_sum {
+                if ($0 ~ /<common:title>/) title = strip_tag($0)
+                if ($0 ~ /<common:publication-date>/) in_pub = 1
+                if ($0 ~ /<\/common:publication-date>/) in_pub = 0
+                if (in_pub && $0 ~ /<common:year>/)  year = strip_tag($0)
+                if (in_pub && $0 ~ /<common:month>/) month = strip_tag($0)
+                if (in_pub && $0 ~ /<common:day>/)   day = strip_tag($0)
+            }
+            END {
+                if (count == 0) print "No works found for this ORCID profile."
+            }
+        '
+    }
+
+    __preprint_provider_orcid_get() {
+        local target="$1"
+        local orcid token base_url auth_header=(-H "Accept: application/vnd.orcid+xml")
+        orcid="${ORCID_ID:-$(__preprint_get_conf orcid orcid)}"
+        [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid profile)"
+        token="${ORCID_TOKEN:-$(__preprint_get_conf orcid token)}"
+        base_url="$(__preprint_orcid_base_url)"
+        [[ -n "$token" ]] && auth_header+=(-H "Authorization: Bearer $token")
+
+        local put_code="$target"
+        if [[ "$target" == *":"* ]]; then
+            orcid="${target%%:*}"
+            put_code="${target#*:}"
+        fi
+
+        if [[ -z "$orcid" ]]; then
+            __log "ORCID iD required (configure via 'preprint database set -d orcid --orcid <id>' or pass '<orcid>:<put-code>')." -t error -l preprint
+            return 1
+        fi
+
+        curl -sSL "${auth_header[@]}" "${base_url}/${orcid}/work/${put_code}" | LC_ALL=C awk '
+            function strip_tag(s) {
+                gsub(/<[^>]+>/, "", s)
+                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s)
+                return s
+            }
+            BEGIN { put_code = ""; title = ""; authors = ""; journal = "N/A"; wtype = "N/A"; year = "N/A"; url = "N/A"; desc = ""; eids = "" }
+            /<work:work / {
+                if (match($0, /put-code="[0-9]+"/)) put_code = substr($0, RSTART + 10, RLENGTH - 11)
+            }
+            /<common:title>/           { if (title == "") title = strip_tag($0) }
+            /<work:credit-name>/       { a = strip_tag($0); authors = (authors == "" ? a : authors ", " a) }
+            /<work:journal-title>/     { journal = strip_tag($0) }
+            /<work:type>/              { wtype = strip_tag($0) }
+            /<work:short-description>/ { desc = strip_tag($0) }
+            /<common:year>/            { if (year == "N/A") year = strip_tag($0) }
+            /<work:url>/               { url = strip_tag($0) }
+            /<common:external-id-type>/  { cur_etype = strip_tag($0) }
+            /<common:external-id-value>/ {
+                cur_eval = strip_tag($0)
+                if (cur_etype != "") {
+                    eids = (eids == "" ? cur_etype ":" cur_eval : eids ", " cur_etype ":" cur_eval)
+                    cur_etype = ""
+                }
+            }
+            END {
+                if (put_code == "" && title == "") {
+                    print "Error: Work not found." > "/dev/stderr"
+                    exit 1
+                }
+                printf "Put-Code:    %s\nTitle:       %s\nAuthors:     %s\nJournal:     %s\nType:        %s\nYear:        %s\nIDs:         %s\nURL:         %s\nDescription:\n  %s\n", put_code, title, (authors ? authors : "N/A"), journal, wtype, year, eids, url, desc
+            }
+        '
+    }
+
+    __preprint_provider_orcid_search() {
+        local term="$1" rows="${2:-50}" start="${3:-0}" sort_by="${4:-time}" reverse="${5:-0}"
+        local base_url enc_term
+        base_url="$(__preprint_orcid_base_url)"
+        enc_term=$(__preprint_urlencode "$term")
+        curl -sSL -H "Accept: application/vnd.orcid+xml" "${base_url}/expanded-search/?q=${enc_term}&start=${start}&rows=${rows}" | LC_ALL=C awk '
+            function strip_tag(s) {
+                gsub(/<[^>]+>/, "", s)
+                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s)
+                return s
+            }
+            BEGIN { in_res = 0; count = 0 }
+            /<expanded-search:expanded-result>/ {
+                in_res = 1; oid = ""; gn = ""; fn = ""; inst = ""
+                next
+            }
+            /<\/expanded-search:expanded-result>/ {
+                in_res = 0; count++
+                author_full = gn (gn && fn ? " " : "") fn
+                if (author_full == "") author_full = "Unknown Researcher"
+                printf "[%s] (ORCID) %s   %s\n", oid, (inst ? inst : "ORCID Profile"), author_full
+                next
+            }
+            in_res {
+                if ($0 ~ /<expanded-search:orcid-id>/)         oid = strip_tag($0)
+                if ($0 ~ /<expanded-search:given-names>/)      gn = strip_tag($0)
+                if ($0 ~ /<expanded-search:family-names>/)     fn = strip_tag($0)
+                if ($0 ~ /<expanded-search:institution-name>/) {
+                    v = strip_tag($0)
+                    inst = (inst == "" ? v : inst ", " v)
+                }
+            }
+            END {
+                if (count == 0) exit 1
+            }
+        ' || echo "No ORCID records found."
+    }
+
+    __preprint_provider_orcid_send() {
+        local file="$PREPRINT_SEND_FILE" meta="$PREPRINT_SEND_META" title="$PREPRINT_SEND_TITLE"
+        local author="$PREPRINT_SEND_AUTHOR" abstract="$PREPRINT_SEND_ABSTRACT"
+        local work_type="${PREPRINT_SEND_TYPE:-preprint}" pub_date="$PREPRINT_SEND_DATE"
+        local journal="$PREPRINT_SEND_JOURNAL" url="$PREPRINT_SEND_URL"
+
+        local orcid token api_url
+        orcid="${ORCID_ID:-$(__preprint_get_conf orcid orcid)}"
+        [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid profile)"
+        token="${ORCID_TOKEN:-$(__preprint_get_conf orcid token)}"
+        api_url="$(__preprint_orcid_api_url)"
+
+        if [[ -z "$orcid" || -z "$token" ]]; then
+            __log "ORCID iD and OAuth token required. Run: preprint database set -d orcid --orcid <ID> --token <TOKEN>" -t error -l preprint
+            return 1
+        fi
+
+        local content_type="application/vnd.orcid+json"
+        local payload=""
+        local meta_source=""
+        if [[ -n "$meta" && -f "$meta" ]]; then
+            meta_source="$meta"
+        elif [[ -n "$file" && ( "$file" == *.json || "$file" == *.xml ) ]]; then
+            meta_source="$file"
+        fi
+
+        if [[ -n "$meta_source" ]]; then
+            [[ "$meta_source" == *.xml ]] && content_type="application/vnd.orcid+xml"
+            payload=$(<"$meta_source")
+        else
+            [[ -z "$title" && -n "$file" ]] && title="$(basename "${file%.*}")"
+            if [[ -z "$title" ]]; then
+                __log "ORCID requires a title (-t/--title) when not passing a JSON/XML metadata file." -t error -l preprint
+                return 1
+            fi
+            if [[ ${#PREPRINT_SEND_EXT_IDS[@]} -eq 0 && -z "$url" ]]; then
+                __log "ORCID requires at least one external identifier (--doi, --arxiv, --hal, --hexagon, --id <prov:id>, or --url)." -t error -l preprint
+                return 1
+            fi
+
+            [[ -z "$pub_date" ]] && printf -v pub_date "%(%Y-%m-%d)T" -1
+            local yr="${pub_date%%-*}" rest="${pub_date#*-}" mo="" dy=""
+            if [[ "$rest" != "$pub_date" ]]; then
+                mo="${rest%%-*}"
+                [[ "${#mo}" -eq 1 ]] && mo="0${mo}"
+                if [[ "$rest" == *-* ]]; then
+                    dy="${rest#*-}"
+                    [[ "${#dy}" -eq 1 ]] && dy="0${dy}"
+                fi
+            fi
+
+            local pub_date_json="{\"year\":{\"value\":\"${yr}\"}"
+            [[ -n "$mo" ]] && pub_date_json+=",\"month\":{\"value\":\"${mo}\"}"
+            [[ -n "$dy" ]] && pub_date_json+=",\"day\":{\"value\":\"${dy}\"}"
+            pub_date_json+="}"
+
+            local ext_ids="" id_type id_val eid_url
+            for id_type in "${!PREPRINT_SEND_EXT_IDS[@]}"; do
+                id_val="${PREPRINT_SEND_EXT_IDS[$id_type]}"
+                [[ -z "$id_val" ]] && continue
+                local eval_esc=$(__preprint_json_escape "$id_val")
+                case "$id_type" in
+                    doi)
+                        ext_ids+="${ext_ids:+,}{\"external-id-type\":\"doi\",\"external-id-value\":\"${eval_esc}\",\"external-id-url\":{\"value\":\"https://doi.org/${eval_esc}\"},\"external-id-relationship\":\"self\"}"
+                        ;;
+                    arxiv)
+                        ext_ids+="${ext_ids:+,}{\"external-id-type\":\"arxiv\",\"external-id-value\":\"${eval_esc}\",\"external-id-url\":{\"value\":\"https://arxiv.org/abs/${eval_esc}\"},\"external-id-relationship\":\"self\"}"
+                        ;;
+                    hal)
+                        ext_ids+="${ext_ids:+,}{\"external-id-type\":\"hal\",\"external-id-value\":\"${eval_esc}\",\"external-id-url\":{\"value\":\"https://hal.science/${eval_esc}\"},\"external-id-relationship\":\"self\"}"
+                        ;;
+                    hexagon)
+                        local clean_hex="${id_val#hexagon:}"
+                        local ehex=$(__preprint_json_escape "$clean_hex")
+                        ext_ids+="${ext_ids:+,}{\"external-id-type\":\"other-id\",\"external-id-value\":\"hexagon:${ehex}\",\"external-id-url\":{\"value\":\"https://hexagonmath.org/${ehex}\"},\"external-id-relationship\":\"self\"}"
+                        [[ -z "$url" ]] && url="https://hexagonmath.org/${clean_hex}"
+                        ;;
+                    *)
+                        eid_url="${url:-https://doi.org/${eval_esc}}"
+                        ext_ids+="${ext_ids:+,}{\"external-id-type\":\"other-id\",\"external-id-value\":\"${id_type}:${eval_esc}\",\"external-id-url\":{\"value\":\"$(__preprint_json_escape "$eid_url")\"},\"external-id-relationship\":\"self\"}"
+                        ;;
+                esac
+            done
+
+            if [[ -z "$ext_ids" && -n "$url" ]]; then
+                local eurl=$(__preprint_json_escape "$url")
+                ext_ids+="{\"external-id-type\":\"uri\",\"external-id-value\":\"${eurl}\",\"external-id-url\":{\"value\":\"${eurl}\"},\"external-id-relationship\":\"self\"}"
+            fi
+
+            local esc_title=$(__preprint_json_escape "$title")
+            local esc_wtype=$(__preprint_json_escape "${work_type:-preprint}")
+            payload="{\"title\":{\"title\":{\"value\":\"${esc_title}\"}},\"type\":\"${esc_wtype}\",\"publication-date\":${pub_date_json},\"external-ids\":{\"external-id\":[${ext_ids}]}"
+
+            if [[ -n "$abstract" ]]; then
+                payload+=",\"short-description\":\"$(__preprint_json_escape "$abstract")\""
+            fi
+            if [[ -n "$journal" ]]; then
+                payload+=",\"journal-title\":{\"value\":\"$(__preprint_json_escape "$journal")\"}"
+            fi
+            if [[ -n "$url" ]]; then
+                payload+=",\"url\":{\"value\":\"$(__preprint_json_escape "$url")\"}"
+            fi
+            if [[ -n "$author" ]]; then
+                local contribs="" idx=0 IFS=';' a
+                for a in $author; do
+                    a="${a#"${a%%[![:space:]]*}"}"
+                    a="${a%"${a##*[![:space:]]}"}"
+                    [[ -z "$a" ]] && continue
+                    local seq="additional"
+                    (( idx == 0 )) && seq="first"
+                    contribs+="${contribs:+,}{\"credit-name\":{\"value\":\"$(__preprint_json_escape "$a")\"},\"contributor-attributes\":{\"contributor-sequence\":\"${seq}\",\"contributor-role\":\"author\"}}"
+                    ((idx++))
+                done
+                [[ -n "$contribs" ]] && payload+=",\"contributors\":{\"contributor\":[${contribs}]}"
+            fi
+            payload+="}"
+        fi
+
+        __log "Posting work '$title' to ORCID ($orcid)..." -t info -l preprint
+        local resp http_code
+        resp=$(curl -sS -w "\n%{http_code}" -X POST "${api_url}/${orcid}/work" \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: ${content_type}" \
+            -H "Accept: application/json" \
+            -d "$payload" 2>&1)
+        http_code="${resp##*$'\n'}"
+        local body="${resp%$'\n'*}"
+        if [[ "$http_code" =~ ^20[012]$ ]]; then
+            __log "Work successfully added to ORCID ($orcid)!" -t success -l preprint
+        else
+            __log "ORCID submission failed (HTTP $http_code)." -t error -l preprint
+            echo "$body" >&2
+            return 1
+        fi
+    }
+}

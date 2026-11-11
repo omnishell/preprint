@@ -1,0 +1,337 @@
+#! /bin/bash
+
+__arxiv__() {
+    __preprint_register_provider "arxiv" \
+        --pagination "offset" \
+        --requires-file "true" \
+        --desc "arXiv.org e-Print archive (Atom API & SWORD deposit)"
+
+    __preprint_parse_arxiv_atom() {
+        local mode="${1:-compact}"
+        LC_ALL=C awk -v mode="$mode" '
+            function strip_entities(s) {
+                gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); gsub(/&amp;/, "\\&", s); gsub(/&quot;/, "\"", s)
+                return s
+            }
+            BEGIN { in_entry = 0; count = 0 }
+            /<entry>/ {
+                in_entry = 1
+                id = ""; title = ""; pub = ""; upd = ""; summary = ""; authors = ""
+                in_title = 0; in_sum = 0
+                next
+            }
+            /<\/entry>/ {
+                in_entry = 0
+                count++
+                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", title)
+                gsub(/[ \t\r\n]+/, " ", title)
+                title = strip_entities(title)
+                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", summary)
+                gsub(/[ \t\r\n]+/, " ", summary)
+                summary = strip_entities(summary)
+                sub(/^.*\/abs\//, "", id)
+                sub(/^oai:arXiv\.org:/, "", id)
+                date_val = (pub != "" ? pub : upd)
+                pub_short = (date_val != "" ? substr(date_val, 1, 10) : "N/A")
+                if (authors == "") authors = "Unknown Author"
+
+                if (mode == "detailed") {
+                    printf "ID:        %s\nTitle:     %s\nPublished: %s\nAuthors:   %s\nURL:       https://arxiv.org/abs/%s\nPDF:       https://arxiv.org/pdf/%s.pdf\nAbstract:\n  %s\n", id, title, pub_short, authors, id, id, summary
+                } else {
+                    printf "[%s] (%s) %s   %s\n", id, pub_short, title, authors
+                }
+                next
+            }
+            in_entry {
+                if ($0 ~ /<id>.*<\/id>/) {
+                    s = $0; sub(/^.*<id>/, "", s); sub(/<\/id>.*$/, "", s)
+                    if (id == "") id = s
+                }
+                if ($0 ~ /<published>.*<\/published>/) {
+                    s = $0; sub(/^.*<published>/, "", s); sub(/<\/published>.*$/, "", s)
+                    pub = s
+                }
+                if ($0 ~ /<updated>.*<\/updated>/) {
+                    s = $0; sub(/^.*<updated>/, "", s); sub(/<\/updated>.*$/, "", s)
+                    upd = s
+                }
+                if ($0 ~ /<(name|dc:creator)>.*<\/(name|dc:creator)>/) {
+                    s = $0
+                    sub(/^.*<(name|dc:creator)>/, "", s)
+                    sub(/<\/(name|dc:creator)>.*$/, "", s)
+                    s = strip_entities(s)
+                    authors = (authors == "" ? s : authors ", " s)
+                }
+                if ($0 ~ /<title[^>]*>/) {
+                    in_title = 1
+                    s = $0; sub(/^.*<title[^>]*>/, "", s)
+                    if (s ~ /<\/title>/) {
+                        sub(/<\/title>.*$/, "", s)
+                        in_title = 0
+                    }
+                    title = title " " s
+                    next
+                }
+                if (in_title) {
+                    s = $0
+                    if (s ~ /<\/title>/) {
+                        sub(/<\/title>.*$/, "", s)
+                        in_title = 0
+                    }
+                    title = title " " s
+                    next
+                }
+                if ($0 ~ /<summary[^>]*>/) {
+                    in_sum = 1
+                    s = $0; sub(/^.*<summary[^>]*>/, "", s)
+                    if (s ~ /<\/summary>/) {
+                        sub(/<\/summary>.*$/, "", s)
+                        in_sum = 0
+                    }
+                    summary = summary " " s
+                    next
+                }
+                if (in_sum) {
+                    s = $0
+                    if (s ~ /<\/summary>/) {
+                        sub(/<\/summary>.*$/, "", s)
+                        in_sum = 0
+                    }
+                    summary = summary " " s
+                    next
+                }
+            }
+            END {
+                if (count == 0) exit 1
+            }
+        '
+    }
+
+    __preprint_provider_arxiv_download() {
+        local id="$1" out_path="${2:-}"
+        local clean_id="${id#arXiv:}"
+        local pdf_url="https://arxiv.org/pdf/${clean_id}.pdf"
+        local default_name="${clean_id//\//_}.pdf"
+        __preprint_save_pdf_stream "$pdf_url" "$default_name" "$out_path"
+    }
+
+    __preprint_provider_arxiv_list() {
+        local max="${1:-0}" sort_by="${2:-time}" reverse="${3:-0}"
+        local limit_arg=$(( max > 0 ? max : 2000 ))
+        local profile orcid user pass
+        profile="${ARXIV_PROFILE:-$(__preprint_get_conf arxiv profile)}"
+        [[ -z "$profile" ]] && profile="$(__preprint_get_conf arxiv author)"
+        orcid="${ARXIV_ORCID:-$(__preprint_get_conf arxiv orcid)}"
+        [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid orcid)"
+        user="${ARXIV_USER:-$(__preprint_get_conf arxiv user)}"
+        pass="${ARXIV_PASS:-$(__preprint_get_conf arxiv pass)}"
+
+        local pid=""
+        for pid in "$profile" "$orcid"; do
+            if [[ -n "$pid" && "$pid" != *" "* ]]; then
+                local feed
+                feed=$(curl -fsSL "https://arxiv.org/a/${pid}.atom2" 2>/dev/null)
+                if [[ "$feed" == *"<entry>"* ]]; then
+                    if (( max > 0 )); then
+                        __preprint_parse_arxiv_atom "compact" <<< "$feed" | head -n "$max"
+                    else
+                        __preprint_parse_arxiv_atom "compact" <<< "$feed"
+                    fi
+                    return 0
+                fi
+            fi
+        done
+
+        if [[ -n "$user" && -n "$pass" ]]; then
+            local sword_xml col_url
+            sword_xml=$(curl -fsSL -u "${user}:${pass}" "https://arxiv.org/sword-app/servicedocument" 2>/dev/null)
+            col_url=$(LC_ALL=C awk '
+                /<collection[^>]*href="[^"]+"/ {
+                    s = $0; sub(/^.*<collection[^>]*href="/, "", s); sub(/".*$/, "", s)
+                    print s; exit
+                }
+            ' <<< "$sword_xml")
+            if [[ -n "$col_url" ]]; then
+                local col_feed
+                col_feed=$(curl -fsSL -u "${user}:${pass}" "$col_url" 2>/dev/null)
+                if [[ "$col_feed" == *"<entry>"* ]]; then
+                    if (( max > 0 )); then
+                        __preprint_parse_arxiv_atom "compact" <<< "$col_feed" | head -n "$max"
+                    else
+                        __preprint_parse_arxiv_atom "compact" <<< "$col_feed"
+                    fi
+                    return 0
+                fi
+            fi
+
+            local cookie_jar login_page csrf_token dashboard_html detected_pid paper_ids
+            cookie_jar="$(mktemp)"
+            login_page=$(curl -fsSL -c "$cookie_jar" "https://arxiv.org/login" 2>/dev/null)
+            csrf_token=$(LC_ALL=C awk '
+                /name="csrf_token"/ {
+                    s = $0
+                    if (match(s, /value="[^"]+"/)) {
+                        print substr(s, RSTART + 7, RLENGTH - 8)
+                        exit
+                    }
+                }
+            ' <<< "$login_page")
+            dashboard_html=$(curl -fsSL -L -b "$cookie_jar" -c "$cookie_jar" \
+                --data-urlencode "username=${user}" \
+                --data-urlencode "password=${pass}" \
+                --data-urlencode "csrf_token=${csrf_token}" \
+                "https://arxiv.org/login" 2>/dev/null)
+            rm -f "$cookie_jar"
+
+            detected_pid=$(LC_ALL=C awk '
+                match($0, /arxiv\.org\/a\/[a-z0-9_-]+_[a-z]_[0-9]+/) {
+                    s = substr($0, RSTART, RLENGTH)
+                    sub(/^.*\/a\//, "", s)
+                    print s; exit
+                }
+            ' <<< "$dashboard_html")
+            if [[ -n "$detected_pid" ]]; then
+                __preprint_database set -d arxiv --profile "$detected_pid" >/dev/null 2>&1
+                local feed
+                feed=$(curl -fsSL "https://arxiv.org/a/${detected_pid}.atom2" 2>/dev/null)
+                if [[ "$feed" == *"<entry>"* ]]; then
+                    if (( max > 0 )); then
+                        __preprint_parse_arxiv_atom "compact" <<< "$feed" | head -n "$max"
+                    else
+                        __preprint_parse_arxiv_atom "compact" <<< "$feed"
+                    fi
+                    return 0
+                fi
+            fi
+
+            paper_ids=$(LC_ALL=C awk '
+                {
+                    s = $0
+                    while (match(s, /\/abs\/([0-9]{4}\.[0-9]{4,5}|[a-z-]+\/[0-9]{7})/)) {
+                        m = substr(s, RSTART + 5, RLENGTH - 5)
+                        if (!(m in seen)) {
+                            seen[m] = 1
+                            out = (out == "" ? m : out "," m)
+                        }
+                        s = substr(s, RSTART + RLENGTH)
+                    }
+                }
+                END { print out }
+            ' <<< "$dashboard_html")
+            if [[ -n "$paper_ids" ]]; then
+                curl -sSL "https://export.arxiv.org/api/query?id_list=${paper_ids}&max_results=${limit_arg}" | __preprint_parse_arxiv_atom "compact"
+                return 0
+            fi
+        fi
+
+        __log "Could not resolve arXiv profile entries. Set your arXiv Author ID or ORCID iD via:   preprint database set -d arxiv --profile <author_id>   OR   preprint database set -d arxiv --orcid <0000-0000-0000-0000>" -t error -l preprint
+        return 1
+    }
+
+    __preprint_provider_arxiv_get() {
+        local id="${1#arXiv:}"
+        curl -sSL "https://export.arxiv.org/api/query?id_list=${id}" | __preprint_parse_arxiv_atom "detailed" || echo "No entry found for '$id'."
+    }
+
+    __preprint_provider_arxiv_search() {
+        local term="$1" max="${2:-50}" start="${3:-0}" sort_by="${4:-time}" reverse="${5:-0}"
+        local query_str=""
+        if [[ "$term" == *:* || "$term" == \"*\" ]]; then
+            query_str="all:$(__preprint_urlencode "$term")"
+            [[ "$term" == *:* ]] && query_str="$(__preprint_urlencode "$term")"
+        else
+            local -a words=()
+            read -ra words <<< "$term"
+            local w ew
+            for w in "${words[@]}"; do
+                [[ -z "$w" ]] && continue
+                ew=$(__preprint_urlencode "$w")
+                if [[ -z "$query_str" ]]; then
+                    query_str="all:${ew}"
+                else
+                    query_str+="+AND+all:${ew}"
+                fi
+            done
+        fi
+        local arxiv_order="descending"
+        (( reverse == 1 )) && arxiv_order="ascending"
+        curl -sSL "https://export.arxiv.org/api/query?search_query=${query_str}&sortBy=submittedDate&sortOrder=${arxiv_order}&start=${start}&max_results=${max}" | __preprint_parse_arxiv_atom "compact" || echo "No entries found."
+    }
+
+    __preprint_provider_arxiv_send() {
+        local file="$PREPRINT_SEND_FILE" meta="$PREPRINT_SEND_META" title="$PREPRINT_SEND_TITLE"
+        local author="$PREPRINT_SEND_AUTHOR" abstract="$PREPRINT_SEND_ABSTRACT" category="${PREPRINT_SEND_CATEGORY:-cs.AI}"
+        local user pass token
+        user="${ARXIV_USER:-$(__preprint_get_conf arxiv user)}"
+        pass="${ARXIV_PASS:-$(__preprint_get_conf arxiv pass)}"
+        token="${ARXIV_TOKEN:-$(__preprint_get_conf arxiv token)}"
+
+        local auth_args=()
+        if [[ -n "$token" ]]; then
+            auth_args=(-H "Authorization: Bearer $token")
+        elif [[ -n "$user" && -n "$pass" ]]; then
+            auth_args=(-u "${user}:${pass}")
+        else
+            __log "arXiv credentials missing. Run: preprint database set -d arxiv --user <user> --pass <pass> (or --token <token>)" -t error -l preprint
+            return 1
+        fi
+
+        local tmp_dir="" upload_zip="$file"
+        if [[ "$file" != *.zip ]]; then
+            tmp_dir="$(mktemp -d)"
+            upload_zip="$tmp_dir/arxiv_submission.zip"
+            [[ -z "$title" ]] && title="$(basename "${file%.*}")"
+            [[ -z "$author" ]] && author="${USER:-Anonymous}"
+            [[ -z "$abstract" ]] && abstract="Preprint submitted via omni preprint."
+
+            if [[ -n "$meta" && -f "$meta" ]]; then
+                cp "$meta" "$tmp_dir/atom.xml"
+            else
+                local esc_title esc_abs esc_cat authors_xml=""
+                esc_title=$(__preprint_xml_escape "$title")
+                esc_abs=$(__preprint_xml_escape "$abstract")
+                esc_cat=$(__preprint_xml_escape "$category")
+                local IFS=';' a
+                for a in $author; do
+                    a="${a#"${a%%[![:space:]]*}"}"
+                    a="${a%"${a##*[![:space:]]}"}"
+                    [[ -z "$a" ]] && continue
+                    authors_xml+="  <author><name>$(__preprint_xml_escape "$a")</name></author>"$'\n'
+                done
+                cat > "$tmp_dir/atom.xml" <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<entry xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <title>${esc_title}</title>
+  <summary>${esc_abs}</summary>
+${authors_xml%$'\n'}
+  <arxiv:primary_category term="${esc_cat}" />
+  <category term="${esc_cat}" scheme="http://arxiv.org/schemas/atom" />
+</entry>
+EOF
+            fi
+            cp -r "$file" "$tmp_dir/"
+            (cd "$tmp_dir" && zip -qr "$upload_zip" .)
+        fi
+
+        __log "Submitting package '$upload_zip' to arXiv SWORD API..." -t info -l preprint
+        local resp http_code
+        resp=$(curl -sS -w "\n%{http_code}" "${auth_args[@]}" \
+            -H "Content-Type: application/zip" \
+            -H "Content-Disposition: filename=$(basename "$upload_zip")" \
+            -H "Packaging: http://purl.org/net/sword/package/SimpleZip" \
+            --data-binary @"$upload_zip" \
+            "https://arxiv.org/sword-app/deposit" 2>&1)
+        [[ -n "$tmp_dir" ]] && rm -rf "$tmp_dir"
+
+        http_code="${resp##*$'\n'}"
+        local body="${resp%$'\n'*}"
+        if [[ "$http_code" =~ ^20[012]$ ]]; then
+            __log "arXiv deposit succeeded (HTTP $http_code)." -t success -l preprint
+            echo "$body"
+        else
+            __log "arXiv deposit failed (HTTP $http_code)." -t error -l preprint
+            echo "$body" >&2
+            return 1
+        fi
+    }
+}

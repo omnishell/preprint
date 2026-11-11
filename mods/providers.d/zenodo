@@ -1,0 +1,242 @@
+#! /bin/bash
+
+__zenodo__() {
+    __preprint_register_provider "zenodo" \
+        --pagination "page" \
+        --requires-file "true" \
+        --desc "Zenodo open research repository (REST API v1)"
+
+    __preprint_zenodo_base_url() {
+        local sb
+        sb="$(__preprint_get_conf zenodo sandbox)"
+        if [[ "$sb" == "true" || "${ZENODO_SANDBOX:-0}" == "1" ]]; then
+            echo "https://sandbox.zenodo.org/api"
+        else
+            echo "https://zenodo.org/api"
+        fi
+    }
+
+    __preprint_parse_zenodo_json() {
+        local mode="${1:-list}"
+        LC_ALL=C awk -v mode="$mode" '
+            function unesc(s) {
+                gsub(/\\"/, "\"", s)
+                gsub(/\\\\/, "\\", s)
+                gsub(/\\n/, " ", s)
+                return s
+            }
+            function get_str(chunk, key,    pat, s) {
+                pat = "\"" key "\"[ \t]*:[ \t]*\""
+                if (match(chunk, pat "(\\\\.|[^\"\\\\])*\"")) {
+                    s = substr(chunk, RSTART, RLENGTH)
+                    sub("^" pat, "", s)
+                    sub(/"$/, "", s)
+                    return unesc(s)
+                }
+                return ""
+            }
+            function get_num(chunk, key,    pat, s) {
+                pat = "\"" key "\"[ \t]*:[ \t]*[0-9]+"
+                if (match(chunk, pat)) {
+                    s = substr(chunk, RSTART, RLENGTH)
+                    sub("^.*:[ \t]*", "", s)
+                    return s
+                }
+                return ""
+            }
+            function get_creators(chunk,    s, out, name_pat, m) {
+                out = ""
+                if (match(chunk, /"creators"[ \t]*:[ \t]*\[[^\]]*\]/)) {
+                    s = substr(chunk, RSTART, RLENGTH)
+                    name_pat = "\"name\"[ \t]*:[ \t]*\"(\\\\.|[^\"\\\\])*\""
+                    while (match(s, name_pat)) {
+                        m = substr(s, RSTART, RLENGTH)
+                        s = substr(s, RSTART + RLENGTH)
+                        sub(/^"name"[ \t]*:[ \t]*"/, "", m)
+                        sub(/"$/, "", m)
+                        out = (out == "" ? unesc(m) : out ", " unesc(m))
+                    }
+                }
+                return out
+            }
+            { raw = raw $0 "\n" }
+            END {
+                if (mode == "create") {
+                    id = get_num(raw, "id")
+                    bucket = get_str(raw, "bucket")
+                    if (id == "") exit 1
+                    print id, bucket
+                    exit 0
+                }
+                if (mode == "detailed") {
+                    id = get_num(raw, "id")
+                    if (id == "") {
+                        msg = get_str(raw, "message")
+                        print "Error: " (msg ? msg : "Record not found") > "/dev/stderr"
+                        exit 1
+                    }
+                    doi = get_str(raw, "doi"); if (doi == "") doi = "N/A"
+                    title = get_str(raw, "title"); if (title == "") title = "Untitled"
+                    pub = get_str(raw, "publication_date"); if (pub == "") pub = "N/A"
+                    html = get_str(raw, "html"); if (html == "") html = "N/A"
+                    desc = get_str(raw, "description")
+                    creators = get_creators(raw)
+                    printf "ID:          %s\nDOI:         %s\nTitle:       %s\nPublished:   %s\nAuthors:     %s\nURL:         %s\nDescription:\n  %s\n", id, doi, title, pub, creators, html, desc
+                    exit 0
+                }
+                n = split(raw, recs, /"created"[ \t]*:/)
+                if (n <= 1) {
+                    exit 1
+                }
+                for (i = 2; i <= n; i++) {
+                    c = "\"created\":" recs[i]
+                    id = get_num(c, "id")
+                    title = get_str(c, "title"); if (title == "") title = "Untitled"
+                    pub = substr(get_str(c, "publication_date"), 1, 10)
+                    if (pub == "") pub = substr(get_str(c, "created"), 1, 10)
+                    if (pub == "") pub = "N/A"
+                    creators = get_creators(c)
+                    if (creators == "") creators = "Unknown Author"
+                    printf "[%s] (%s) %s   %s\n", id, pub, title, creators
+                }
+            }
+        '
+    }
+
+    __preprint_provider_zenodo_download() {
+        local id="$1" out_path="${2:-}"
+        local base_url token auth_header=()
+        base_url="$(__preprint_zenodo_base_url)"
+        token="${ZENODO_TOKEN:-$(__preprint_get_conf zenodo token)}"
+        [[ -n "$token" ]] && auth_header=(-H "Authorization: Bearer $token")
+
+        local json pdf_url
+        json=$(curl -sSL "${auth_header[@]}" "${base_url}/records/${id}" 2>/dev/null)
+        pdf_url=$(LC_ALL=C awk '
+            { raw = raw $0 "\n" }
+            END {
+                s = raw
+                while (match(s, /"https?:\/\/[^"]+\.pdf(\/content)?"/)) {
+                    u = substr(s, RSTART + 1, RLENGTH - 2)
+                    print u; exit
+                }
+                s = raw
+                while (match(s, /"self"[ \t]*:[ \t]*"https?:\/\/[^"]+\/files\/[^"]+"/)) {
+                    u = substr(s, RSTART, RLENGTH)
+                    sub(/^"self"[ \t]*:[ \t]*"/, "", u)
+                    sub(/"$/, "", u)
+                    print u; exit
+                }
+            }
+        ' <<< "$json")
+
+        if [[ -z "$pdf_url" ]]; then
+            __log "Could not resolve a direct PDF URL for '$id' in zenodo." -t error -l preprint
+            return 1
+        fi
+        __preprint_save_pdf_stream "$pdf_url" "zenodo_${id}.pdf" "$out_path"
+    }
+
+    __preprint_provider_zenodo_list() {
+        local max="${1:-0}" sort_by="${2:-time}" reverse="${3:-0}"
+        local size=$(( max > 0 ? max : 1000 ))
+        local token base_url
+        token="${ZENODO_TOKEN:-$(__preprint_get_conf zenodo token)}"
+        base_url="$(__preprint_zenodo_base_url)"
+        if [[ -z "$token" ]]; then
+            __log "Zenodo token required to list profile depositions. Run: preprint database set -d zenodo --token <TOKEN>" -t error -l preprint
+            return 1
+        fi
+        curl -sSL -H "Authorization: Bearer $token" "${base_url}/deposit/depositions?size=${size}" | __preprint_parse_zenodo_json "list" || echo "No records found."
+    }
+
+    __preprint_provider_zenodo_get() {
+        local id="$1"
+        local base_url token auth_header=()
+        base_url="$(__preprint_zenodo_base_url)"
+        token="${ZENODO_TOKEN:-$(__preprint_get_conf zenodo token)}"
+        [[ -n "$token" ]] && auth_header=(-H "Authorization: Bearer $token")
+        curl -sSL "${auth_header[@]}" "${base_url}/records/${id}" | __preprint_parse_zenodo_json "detailed"
+    }
+
+    __preprint_provider_zenodo_search() {
+        local term="$1" page_size="${2:-50}" page="${3:-1}" sort_by="${4:-time}" reverse="${5:-0}"
+        local base_url enc_term zenodo_sort="mostrecent"
+        base_url="$(__preprint_zenodo_base_url)"
+        enc_term=$(__preprint_urlencode "$term")
+        if [[ "$sort_by" == "time" && $reverse -eq 1 ]]; then
+            zenodo_sort="-mostrecent"
+        fi
+        curl -sSL "${base_url}/records?q=${enc_term}&sort=${zenodo_sort}&size=${page_size}&page=${page}" | __preprint_parse_zenodo_json "search" || echo "No records found."
+    }
+
+    __preprint_provider_zenodo_send() {
+        local file="$PREPRINT_SEND_FILE" meta="$PREPRINT_SEND_META" title="$PREPRINT_SEND_TITLE"
+        local author="$PREPRINT_SEND_AUTHOR" abstract="$PREPRINT_SEND_ABSTRACT"
+        local publish="${PREPRINT_SEND_PUBLISH:-0}" doi="$PREPRINT_SEND_DOI"
+        local token base_url
+        token="${ZENODO_TOKEN:-$(__preprint_get_conf zenodo token)}"
+        base_url="$(__preprint_zenodo_base_url)"
+        if [[ -z "$token" ]]; then
+            __log "Zenodo token missing. Run: preprint database set -d zenodo --token <TOKEN>" -t error -l preprint
+            return 1
+        fi
+
+        local meta_payload="{}"
+        if [[ -n "$meta" && -f "$meta" ]]; then
+            meta_payload=$(<"$meta")
+        else
+            [[ -z "$title" ]] && title="$(basename "${file%.*}")"
+            [[ -z "$author" ]] && author="${USER:-Anonymous}"
+            [[ -z "$abstract" ]] && abstract="Preprint uploaded via omni preprint tool."
+            local esc_title esc_desc esc_doi creators_json=""
+            esc_title=$(__preprint_json_escape "$title")
+            esc_desc=$(__preprint_json_escape "$abstract")
+            esc_doi=$(__preprint_json_escape "$doi")
+            local IFS=';' a
+            for a in $author; do
+                a="${a#"${a%%[![:space:]]*}"}"
+                a="${a%"${a##*[![:space:]]}"}"
+                [[ -z "$a" ]] && continue
+                creators_json+="${creators_json:+,}{\"name\":\"$(__preprint_json_escape "$a")\"}"
+            done
+            local doi_field=""
+            [[ -n "$esc_doi" ]] && doi_field=",\"doi\":\"${esc_doi}\""
+            meta_payload="{\"metadata\":{\"title\":\"${esc_title}\",\"upload_type\":\"publication\",\"publication_type\":\"preprint\",\"description\":\"${esc_desc}\",\"creators\":[${creators_json}]${doi_field}}}"
+        fi
+
+        __log "Creating Zenodo deposition..." -t info -l preprint
+        local create_resp dep_id bucket_url
+        create_resp=$(curl -sSL -X POST "${base_url}/deposit/depositions" \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            -d "$meta_payload")
+
+        read -r dep_id bucket_url < <(__preprint_parse_zenodo_json "create" <<< "$create_resp") || {
+            __log "Failed to create Zenodo deposition." -t error -l preprint
+            echo "$create_resp" >&2
+            return 1
+        }
+
+        __log "Uploading file '$(basename "$file")' to Zenodo bucket (ID: $dep_id)..." -t info -l preprint
+        if [[ -n "$bucket_url" ]]; then
+            curl -sSL -X PUT "${bucket_url}/$(basename "$file")" \
+                -H "Authorization: Bearer $token" \
+                --upload-file "$file" >/dev/null
+        else
+            curl -sSL -X POST "${base_url}/deposit/depositions/${dep_id}/files" \
+                -H "Authorization: Bearer $token" \
+                -F "name=$(basename "$file")" \
+                -F "file=@${file}" >/dev/null
+        fi
+
+        if (( publish == 1 )); then
+            __log "Publishing Zenodo deposition $dep_id..." -t info -l preprint
+            curl -sSL -X POST "${base_url}/deposit/depositions/${dep_id}/actions/publish" \
+                -H "Authorization: Bearer $token" >/dev/null
+            __log "Zenodo record published! ID: $dep_id" -t success -l preprint
+        else
+            __log "Zenodo draft created! ID: $dep_id (Review at ${base_url%/api}/deposit/${dep_id})" -t success -l preprint
+        fi
+    }
+}
