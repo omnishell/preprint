@@ -10,7 +10,7 @@ __preprint__() {
     __preprint__.__help__() {
         cat <<'EOF' >&2
 ABOUT:
-    omni academic preprint & publication manager (arXiv, Zenodo, HAL, ORCID)
+    omni academic preprint & publication manager (arXiv, Zenodo, HAL, ORCID, Hexagon Math)
 
 USAGE:
     preprint database <ls|set|rm> [<database>] [options]
@@ -21,7 +21,7 @@ USAGE:
     preprint send [<file>] -d/--database <database> [options]
 
 DATABASES:
-    arxiv, zenodo, hal, orcid
+    arxiv, zenodo, hal, orcid, hexagon
 
 DOWNLOADING PDFS:
     - Inside fzf ('search' or 'get'): Press Ctrl-D to immediately download the highlighted entry's PDF,
@@ -38,29 +38,30 @@ DATABASE COMMANDS:
     database rm <database>             Remove configuration for a database
 
 OPTIONS (for 'database set <database>'):
-    --profile <id>          Profile ID (arXiv Author ID e.g. 'martins_y_1', HAL idHAL, or ORCID iD)
-    --orcid <id>            ORCID iD (e.g., 0000-0002-1825-0097; works for ORCID, arXiv & HAL profiles)
-    --token <token>         API Token / OAuth Bearer token (Zenodo, ORCID, arXiv, HAL)
-    --user <user>           Account username/email (arXiv, HAL)
-    --pass <pass>           Account password (arXiv, HAL)
+    --profile <id>          Profile ID (arXiv Author ID, HAL idHAL, ORCID iD, or Hexagon User ID e.g. 'user_...')
+    --orcid <id>            ORCID iD (e.g., 0000-0002-1825-0097; works for ORCID, arXiv, HAL & Hexagon profiles)
+    --token <token>         API Token / OAuth Bearer token (Zenodo, ORCID, arXiv, HAL, Hexagon)
+    --user <user>           Account username/email (arXiv, HAL, Hexagon)
+    --pass <pass>           Account password (arXiv, HAL, Hexagon)
     --sandbox               Use sandbox/preprod API endpoints
     --no-sandbox            Use production API endpoints (default)
 
 OPTIONS (for 'send'):
-    -d, --database <db>     Target database (arxiv, zenodo, hal, orcid)
+    -d, --database <db>     Target database (arxiv, zenodo, hal, orcid, hexagon)
     -m, --meta <file>       Custom metadata file (JSON/XML) instead of CLI flags
     -t, --title <title>     Title of the paper/work
     -a, --author <authors>  Authors separated by ';' (e.g., "John Doe; Jane Smith")
     -A, --abstract <text>   Abstract or short description
-    -c, --category <cat>    Domain/Category (e.g., "cs.AI" for arXiv, "info.info-ai" for HAL)
+    -c, --category <cat>    Domain/Category (e.g., "math.NT" for Hexagon/arXiv, "info.info-ai" for HAL)
     --doi <doi>             DOI identifier (for ORCID / Zenodo / HAL)
     --arxiv <id>            arXiv ID (for ORCID external-id)
     --hal <id>              HAL ID (for ORCID external-id)
+    --hexagon <id>          Hexagon ID (e.g., 2610.00244v1; for ORCID external-id)
     --url <url>             Work URL (for ORCID)
     --journal <name>        Journal or host venue title (for ORCID)
     --type <type>           Work type (default: "preprint"; e.g., "journal-article")
     --date <YYYY[-MM[-DD]]> Publication date (default: today)
-    --publish               Immediately publish deposit (Zenodo)
+    --publish               Immediately publish deposit (Zenodo / Hexagon)
 EOF
     }
 
@@ -103,7 +104,7 @@ EOF
         local prev="${COMP_WORDS[COMP_CWORD-1]:-}"
         local cmd="${COMP_WORDS[1]:-}"
         local subcmd="${COMP_WORDS[2]:-}"
-        local dbs="arxiv zenodo hal orcid"
+        local dbs="arxiv zenodo hal orcid hexagon"
 
         if [[ $COMP_CWORD -eq 1 ]]; then
             COMPREPLY=( $(compgen -W "database list get search download send --help -h" -- "$cur") )
@@ -156,7 +157,7 @@ EOF
                 ;;
             send|push|publish)
                 if [[ "$cur" == -* ]]; then
-                    COMPREPLY=( $(compgen -W "-d --database -m --meta -t --title -a --author -A --abstract -c --category --doi --arxiv --hal --url --journal --type --date --publish" -- "$cur") )
+                    COMPREPLY=( $(compgen -W "-d --database -m --meta -t --title -a --author -A --abstract -c --category --doi --arxiv --hal --hexagon --url --journal --type --date --publish" -- "$cur") )
                 else
                     COMPREPLY=( $(compgen -f -- "$cur") )
                 fi
