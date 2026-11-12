@@ -1,0 +1,173 @@
+#! /bin/bash
+
+__s2__() {
+    __preprint_register_provider "s2" \
+        --aliases "semanticscholar,semantic-scholar,semantic" \
+        --pagination "offset" \
+        --requires-file "false" \
+        --desc "Semantic Scholar Academic Graph API (search, author profile works, OA PDFs)"
+
+    __preprint_s2_headers() {
+        local token="${S2_TOKEN:-$(__preprint_get_conf s2 token)}"
+        [[ -n "$token" ]] && printf '%s\n' "-H" "x-api-key: $token"
+    }
+
+    __preprint_parse_s2_json() {
+        local mode="${1:-compact}"
+        LC_ALL=C awk -v mode="$mode" '
+            function unesc(s) {
+                gsub(/\\"/, "\"", s); gsub(/\\\\/, "\\", s); gsub(/\\n/, " ", s); gsub(/\\t/, " ", s)
+                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s)
+                return s
+            }
+            function get_str(chunk, key,    pat, s) {
+                pat = "\"" key "\"[ \t]*:[ \t]*\""
+                if (match(chunk, pat "(\\\\.|[^\"\\\\])*\"")) {
+                    s = substr(chunk, RSTART, RLENGTH)
+                    sub("^" pat, "", s); sub(/"$/, "", s)
+                    return unesc(s)
+                }
+                return ""
+            }
+            function get_num(chunk, key,    pat, s) {
+                pat = "\"" key "\"[ \t]*:[ \t]*[0-9]+"
+                if (match(chunk, pat)) {
+                    s = substr(chunk, RSTART, RLENGTH)
+                    sub("^.*:[ \t]*", "", s)
+                    return s
+                }
+                return ""
+            }
+            function get_authors(chunk,    s, out, pat, m) {
+                out = ""
+                if (match(chunk, /"authors"[ \t]*:[ \t]*\[[^\]]*\]/)) {
+                    s = substr(chunk, RSTART, RLENGTH)
+                    pat = "\"name\"[ \t]*:[ \t]*\"(\\\\.|[^\"\\\\])*\""
+                    while (match(s, pat)) {
+                        m = substr(s, RSTART, RLENGTH)
+                        s = substr(s, RSTART + RLENGTH)
+                        sub(/^"name"[ \t]*:[ \t]*"/, "", m); sub(/"$/, "", m)
+                        out = (out == "" ? unesc(m) : out ", " unesc(m))
+                    }
+                }
+                return out
+            }
+            { raw = raw $0 "\n" }
+            END {
+                if (mode == "detailed") {
+                    pid = get_str(raw, "paperId")
+                    if (pid == "") exit 1
+                    title = get_str(raw, "title"); if (title == "") title = "Untitled"
+                    pub = get_str(raw, "publicationDate")
+                    if (pub == "") pub = get_num(raw, "year")
+                    if (pub == "") pub = "N/A"
+                    venue = get_str(raw, "venue"); if (venue == "") venue = "N/A"
+                    cites = get_num(raw, "citationCount"); if (cites == "") cites = "0"
+                    url = get_str(raw, "url"); if (url == "") url = "https://www.semanticscholar.org/paper/" pid
+                    doi = get_str(raw, "DOI"); if (doi == "") doi = "N/A"
+                    arx = get_str(raw, "ArXiv"); if (arx == "") arx = "N/A"
+                    abs = get_str(raw, "abstract"); if (abs == "") abs = "N/A"
+                    authors = get_authors(raw); if (authors == "") authors = "Unknown Author"
+                    pdf = ""
+                    if (match(raw, /"openAccessPdf"[ \t]*:[ \t]*\{[^}]*\}/)) {
+                        oa_chunk = substr(raw, RSTART, RLENGTH)
+                        pdf = get_str(oa_chunk, "url")
+                    }
+                    if (pdf == "" && arx != "N/A") pdf = "https://arxiv.org/pdf/" arx ".pdf"
+                    printf "PaperId:   %s\nTitle:     %s\nPublished: %s\nAuthors:   %s\nVenue:     %s\nCitations: %s\nDOI:       %s\nArXiv:     %s\nURL:       %s\nPDF:       %s\nAbstract:\n  %s\n", pid, title, pub, authors, venue, cites, doi, arx, url, (pdf ? pdf : "N/A"), abs
+                    exit 0
+                }
+                if (mode == "pdf") {
+                    pdf = ""
+                    if (match(raw, /"openAccessPdf"[ \t]*:[ \t]*\{[^}]*\}/)) {
+                        pdf = get_str(substr(raw, RSTART, RLENGTH), "url")
+                    }
+                    arx = get_str(raw, "ArXiv")
+                    doi = get_str(raw, "DOI")
+                    printf "%s\t%s\t%s\n", (pdf != "" ? pdf : "-"), (arx != "" ? arx : "-"), (doi != "" ? doi : "-")
+                    exit 0
+                }
+
+                n = split(raw, items, /"paperId"[ \t]*:[ \t]*"/)
+                if (n <= 1) exit 1
+                count = 0
+                for (i = 2; i <= n; i++) {
+                    c = "\"paperId\":\"" items[i]
+                    pid = get_str(c, "paperId")
+                    if (pid == "" || (pid in seen)) continue
+                    title = get_str(c, "title")
+                    if (title == "") continue
+                    seen[pid] = 1
+                    pub = get_str(c, "publicationDate")
+                    if (pub == "") {
+                        yr = get_num(c, "year")
+                        pub = (yr != "" ? yr "-01-01" : "N/A")
+                    }
+                    authors = get_authors(c)
+                    if (authors == "") authors = "Unknown Author"
+                    printf "[%s] (%s) %s   %s\n", pid, pub, title, authors
+                    count++
+                }
+                if (count == 0) exit 1
+            }
+        '
+    }
+
+    __preprint_provider_s2_list() {
+        local max="${1:-0}" sort_by="${2:-time}" reverse="${3:-0}"
+        local limit=$(( max > 0 && max <= 1000 ? max : 200 ))
+        local profile="${S2_PROFILE:-$(__preprint_get_conf s2 profile)}"
+        [[ -z "$profile" ]] && profile="$(__preprint_get_conf s2 author)"
+
+        if [[ -z "$profile" ]]; then
+            __log "Set your Semantic Scholar Author ID first:
+  preprint database set -d s2 --profile <author_id>" -t error -l preprint
+            return 1
+        fi
+
+        local -a hdrs=()
+        mapfile -t hdrs < <(__preprint_s2_headers)
+        local fields="paperId,title,year,publicationDate,authors"
+        curl -fsSL "${hdrs[@]}" "https://api.semanticscholar.org/graph/v1/author/${profile}/papers?fields=${fields}&limit=${limit}" 2>/dev/null | __preprint_parse_s2_json "compact" || echo "No entries found in Semantic Scholar."
+    }
+
+    __preprint_provider_s2_get() {
+        local id="$1"
+        local -a hdrs=()
+        mapfile -t hdrs < <(__preprint_s2_headers)
+        local fields="paperId,title,abstract,year,publicationDate,venue,citationCount,authors,url,openAccessPdf,externalIds"
+        curl -fsSL "${hdrs[@]}" "https://api.semanticscholar.org/graph/v1/paper/$(__preprint_urlencode "$id")?fields=${fields}" 2>/dev/null | __preprint_parse_s2_json "detailed" || echo "No entry found in Semantic Scholar for '$id'."
+    }
+
+    __preprint_provider_s2_search() {
+        local term="$1" limit="${2:-50}" offset="${3:-0}" sort_by="${4:-time}" reverse="${5:-0}"
+        (( limit > 100 )) && limit=100
+        local enc_term=$(__preprint_urlencode "$term")
+        local -a hdrs=()
+        mapfile -t hdrs < <(__preprint_s2_headers)
+        local fields="paperId,title,year,publicationDate,authors"
+        curl -fsSL "${hdrs[@]}" "https://api.semanticscholar.org/graph/v1/paper/search?query=${enc_term}&offset=${offset}&limit=${limit}&fields=${fields}" 2>/dev/null | __preprint_parse_s2_json "compact" || echo "No entries found in Semantic Scholar."
+    }
+
+    __preprint_provider_s2_download() {
+        local id="$1" out_path="${2:-}"
+        local -a hdrs=()
+        mapfile -t hdrs < <(__preprint_s2_headers)
+        local json pdf_url arx_id doi_id
+        json=$(curl -fsSL "${hdrs[@]}" "https://api.semanticscholar.org/graph/v1/paper/$(__preprint_urlencode "$id")?fields=openAccessPdf,externalIds" 2>/dev/null)
+        read -r pdf_url arx_id doi_id < <(__preprint_parse_s2_json "pdf" <<< "$json")
+
+        if [[ -n "$pdf_url" && "$pdf_url" != "-" ]]; then
+            __preprint_save_pdf_stream "$pdf_url" "s2_${id//\//_}.pdf" "$out_path"
+            return $?
+        elif [[ -n "$arx_id" && "$arx_id" != "-" ]]; then
+            __preprint_download_entry "arxiv" "$arx_id" "$out_path"
+            return $?
+        elif [[ -n "$doi_id" && "$doi_id" != "-" ]]; then
+            __preprint_resolve_doi_pdf "$doi_id" "$out_path" "s2_${id//\//_}.pdf"
+            return $?
+        fi
+        __log "No Open-Access PDF available for Semantic Scholar paper '$id'." -t error -l preprint
+        return 1
+    }
+}

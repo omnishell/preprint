@@ -1,0 +1,128 @@
+#! /bin/bash
+
+__crossref__() {
+    __preprint_register_provider "crossref" \
+        --aliases "cr,doi" \
+        --pagination "offset" \
+        --requires-file "false" \
+        --desc "CrossRef DOI & scholarly metadata registry (REST API)"
+
+    __preprint_parse_crossref() {
+        local mode="${1:-compact}"
+        LC_ALL=C awk -v mode="$mode" '
+            function unesc(s) {
+                gsub(/\\"/, "\"", s); gsub(/\\\\/, "\\", s); gsub(/\\n/, " ", s)
+                gsub(/<[^>]+>/, "", s)
+                return s
+            }
+            function get_str(chunk, key,    pat, s) {
+                pat = "\"" key "\"[ \t]*:[ \t]*\""
+                if (match(chunk, pat "(\\\\.|[^\"\\\\])*\"")) {
+                    s = substr(chunk, RSTART, RLENGTH)
+                    sub("^" pat, "", s); sub(/"$/, "", s)
+                    return unesc(s)
+                }
+                return ""
+            }
+            function get_arr_first(chunk, key,    pat, s) {
+                pat = "\"" key "\"[ \t]*:[ \t]*\\[[ \t]*\"(\\\\.|[^\"\\\\])*\""
+                if (match(chunk, pat)) {
+                    s = substr(chunk, RSTART, RLENGTH)
+                    sub("^" "\"" key "\"[ \t]*:[ \t]*\\[[ \t]*\"", "", s)
+                    sub(/"$/, "", s)
+                    return unesc(s)
+                }
+                return ""
+            }
+            function get_date(chunk,    s, yr, mo, dy) {
+                if (match(chunk, /"date-parts"[ \t]*:[ \t]*\[\[[0-9, \t]+\]\]/)) {
+                    s = substr(chunk, RSTART, RLENGTH)
+                    sub(/^.*\[\[/, "", s); sub(/\]\].*$/, "", s)
+                    gsub(/[ \t]/, "", s)
+                    split(s, p, ",")
+                    yr = p[1]
+                    mo = (p[2] != "" ? (length(p[2]) == 1 ? "0" p[2] : p[2]) : "01")
+                    dy = (p[3] != "" ? (length(p[3]) == 1 ? "0" p[3] : p[3]) : "01")
+                    return yr "-" mo "-" dy
+                }
+                return "N/A"
+            }
+            function get_authors(chunk,    s, out, gn, fn, blk) {
+                out = ""
+                if (match(chunk, /"author"[ \t]*:[ \t]*\[[^\]]*\]/)) {
+                    s = substr(chunk, RSTART, RLENGTH)
+                    while (match(s, /\{[^}]*\}/)) {
+                        blk = substr(s, RSTART, RLENGTH)
+                        s = substr(s, RSTART + RLENGTH)
+                        gn = get_str(blk, "given")
+                        fn = get_str(blk, "family")
+                        if (gn != "" || fn != "") {
+                            full = gn (gn && fn ? " " : "") fn
+                            out = (out == "" ? full : out ", " full)
+                        }
+                    }
+                }
+                return out
+            }
+            { raw = raw $0 "\n" }
+            END {
+                if (mode == "detailed") {
+                    doi = get_str(raw, "DOI")
+                    if (doi == "") exit 1
+                    title = get_arr_first(raw, "title"); if (title == "") title = "Untitled"
+                    journal = get_arr_first(raw, "container-title"); if (journal == "") journal = "N/A"
+                    pub = get_date(raw)
+                    wtype = get_str(raw, "type")
+                    url = get_str(raw, "URL"); if (url == "") url = "https://doi.org/" doi
+                    abs = get_str(raw, "abstract"); if (abs == "") abs = "N/A"
+                    authors = get_authors(raw); if (authors == "") authors = "Unknown Author"
+                    printf "DOI:       %s\nTitle:     %s\nPublished: %s\nAuthors:   %s\nJournal:   %s\nType:      %s\nURL:       %s\nAbstract:\n  %s\n", doi, title, pub, authors, journal, wtype, url, abs
+                    exit 0
+                }
+                n = split(raw, items, /"DOI"[ \t]*:[ \t]*"/)
+                if (n <= 1) exit 1
+                for (i = 2; i <= n; i++) {
+                    c = "\"DOI\":\"" items[i]
+                    doi = get_str(c, "DOI")
+                    title = get_arr_first(c, "title")
+                    if (doi == "" || title == "") continue
+                    pub = get_date(c)
+                    authors = get_authors(c)
+                    if (authors == "") authors = "Unknown Author"
+                    printf "[%s] (%s) %s   %s\n", doi, pub, title, authors
+                }
+            }
+        '
+    }
+
+    __preprint_provider_crossref_list() {
+        local max="${1:-0}" sort_by="${2:-time}" reverse="${3:-0}"
+        local rows=$(( max > 0 && max <= 1000 ? max : 100 ))
+        local orcid="${CROSSREF_ORCID:-$(__preprint_get_conf crossref orcid)}"
+        [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf crossref profile)"
+        [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid orcid)"
+
+        if [[ -z "$orcid" ]]; then
+            __log "Set your ORCID iD to list CrossRef works:
+  preprint database set -d crossref --orcid <0000-0000-0000-0000>" -t error -l preprint
+            return 1
+        fi
+        curl -fsSL "https://api.crossref.org/works?filter=orcid:${orcid}&rows=${rows}&sort=published&order=desc" 2>/dev/null | __preprint_parse_crossref "compact" || echo "No entries found in CrossRef."
+    }
+
+    __preprint_provider_crossref_get() {
+        local doi="${1#https://doi.org/}"
+        curl -fsSL "https://api.crossref.org/works/$(__preprint_urlencode "$doi")" 2>/dev/null | __preprint_parse_crossref "detailed" || echo "No entry found in CrossRef for '$doi'."
+    }
+
+    __preprint_provider_crossref_search() {
+        local term="$1" rows="${2:-50}" offset="${3:-0}" sort_by="${4:-time}" reverse="${5:-0}"
+        local enc_term=$(__preprint_urlencode "$term")
+        curl -fsSL "https://api.crossref.org/works?query=${enc_term}&rows=${rows}&offset=${offset}" 2>/dev/null | __preprint_parse_crossref "compact" || echo "No entries found in CrossRef."
+    }
+
+    __preprint_provider_crossref_download() {
+        local doi="${1#https://doi.org/}" out_path="${2:-}"
+        __preprint_resolve_doi_pdf "$doi" "$out_path" "crossref_${doi//\//_}.pdf"
+    }
+}

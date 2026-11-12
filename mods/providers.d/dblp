@@ -1,0 +1,111 @@
+#! /bin/bash
+
+__dblp__() {
+    __preprint_register_provider "dblp" \
+        --pagination "offset" \
+        --requires-file "false" \
+        --desc "DBLP Computer Science Bibliography (XML Search & Author PID feeds)"
+
+    __preprint_parse_dblp_xml() {
+        local mode="${1:-compact}"
+        LC_ALL=C awk -v mode="$mode" '
+            function strip_tag(s) {
+                gsub(/<[^>]+>/, "", s)
+                gsub(/&amp;/, "\\&", s); gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s)
+                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s)
+                return s
+            }
+            BEGIN { in_rec = 0; count = 0 }
+            /<(info|article|inproceedings|proceedings|book|incollection|phdthesis|mastersthesis|informal)([ \t>]|$)/ {
+                if (!in_rec) {
+                    in_rec = 1
+                    key = ""; title = ""; authors = ""; year = "N/A"; venue = "N/A"; doi = "N/A"; ee = ""; url = ""
+                    if (match($0, /key="[^"]+"/)) {
+                        key = substr($0, RSTART + 5, RLENGTH - 6)
+                    }
+                }
+            }
+            /<\/(info|article|inproceedings|proceedings|book|incollection|phdthesis|mastersthesis|informal)>/ {
+                if (in_rec && title != "") {
+                    in_rec = 0
+                    count++
+                    if (key == "") key = "dblp_" count
+                    if (authors == "") authors = "Unknown Author"
+                    if (mode == "detailed") {
+                        printf "Key:       %s\nTitle:     %s\nYear:      %s\nAuthors:   %s\nVenue:     %s\nDOI:       %s\nURL:       %s\nEE/PDF:    %s\n", key, title, year, authors, venue, doi, (url ? url : "https://dblp.org/rec/" key), (ee ? ee : "N/A")
+                        exit 0
+                    } else if (mode == "ee") {
+                        printf "%s\t%s\n", (ee ? ee : "-"), (doi != "N/A" ? doi : "-")
+                        exit 0
+                    } else {
+                        printf "[%s] (%s) %s   %s\n", key, year, title, authors
+                    }
+                }
+            }
+            in_rec {
+                if ($0 ~ /<key>/)     key = strip_tag($0)
+                if ($0 ~ /<title>/)   title = strip_tag($0)
+                if ($0 ~ /<author/)   { a = strip_tag($0); authors = (authors == "" ? a : authors ", " a) }
+                if ($0 ~ /<year>/)    year = strip_tag($0)
+                if ($0 ~ /<(venue|journal|booktitle)>/) venue = strip_tag($0)
+                if ($0 ~ /<doi>/)     doi = strip_tag($0)
+                if ($0 ~ /<ee[^>]*>/) { if (ee == "") ee = strip_tag($0) }
+                if ($0 ~ /<url>/)     url = strip_tag($0)
+            }
+            END {
+                if (count == 0) exit 1
+            }
+        '
+    }
+
+    __preprint_provider_dblp_list() {
+        local max="${1:-0}" sort_by="${2:-time}" reverse="${3:-0}"
+        local profile="${DBLP_PROFILE:-$(__preprint_get_conf dblp profile)}"
+        if [[ -z "$profile" ]]; then
+            __log "Set your DBLP Author PID (e.g., '12/3456' or 'k/DonaldEKnuth') first:
+  preprint database set -d dblp --profile <pid>" -t error -l preprint
+            return 1
+        fi
+        local out
+        out=$(curl -fsSL "https://dblp.org/pid/${profile}.xml" 2>/dev/null | __preprint_parse_dblp_xml "compact")
+        if [[ -n "$out" ]]; then
+            (( max > 0 )) && head -n "$max" <<< "$out" || echo "$out"
+        else
+            echo "No entries found in DBLP."
+        fi
+    }
+
+    __preprint_provider_dblp_get() {
+        local key="${1%.xml}"
+        curl -fsSL "https://dblp.org/rec/${key}.xml" 2>/dev/null | __preprint_parse_dblp_xml "detailed" || echo "No entry found in DBLP for '$key'."
+    }
+
+    __preprint_provider_dblp_search() {
+        local term="$1" hits="${2:-50}" first="${3:-0}" sort_by="${4:-time}" reverse="${5:-0}"
+        local enc_term=$(__preprint_urlencode "$term")
+        curl -fsSL "https://dblp.org/search/publ/api?q=${enc_term}&h=${hits}&f=${first}&format=xml" 2>/dev/null | __preprint_parse_dblp_xml "compact" || echo "No entries found in DBLP."
+    }
+
+    __preprint_provider_dblp_download() {
+        local key="${1%.xml}" out_path="${2:-}"
+        local xml ee doi
+        xml=$(curl -fsSL "https://dblp.org/rec/${key}.xml" 2>/dev/null)
+        read -r ee doi < <(__preprint_parse_dblp_xml "ee" <<< "$xml")
+
+        if [[ "$ee" =~ arxiv\.org/abs/(.+)$ ]]; then
+            __preprint_download_entry "arxiv" "${BASH_REMATCH[1]}" "$out_path"
+            return $?
+        elif [[ "$ee" == *.pdf ]]; then
+            __preprint_save_pdf_stream "$ee" "dblp_${key//\//_}.pdf" "$out_path"
+            return $?
+        elif [[ -n "$doi" && "$doi" != "-" ]]; then
+            __preprint_resolve_doi_pdf "$doi" "$out_path" "dblp_${key//\//_}.pdf"
+            return $?
+        elif [[ "$ee" =~ doi\.org/(10\..+)$ ]]; then
+            __preprint_resolve_doi_pdf "${BASH_REMATCH[1]}" "$out_path" "dblp_${key//\//_}.pdf"
+            return $?
+        fi
+        __log "Could not resolve an Open-Access PDF for DBLP record '$key'." -t error -l preprint
+        return 1
+    }
+}

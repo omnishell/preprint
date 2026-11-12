@@ -1,0 +1,141 @@
+#! /bin/bash
+
+__openalex__() {
+    __preprint_register_provider "openalex" \
+        --aliases "oa,open-alex" \
+        --pagination "page" \
+        --requires-file "false" \
+        --desc "OpenAlex global scholarly catalog (250M+ works, author profiles, OA PDFs)"
+
+    __preprint_parse_openalex() {
+        local mode="${1:-compact}"
+        LC_ALL=C awk -v mode="$mode" '
+            function unesc(s) {
+                gsub(/\\"/, "\"", s); gsub(/\\\\/, "\\", s); gsub(/\\n/, " ", s)
+                return s
+            }
+            function get_str(chunk, key,    pat, s) {
+                pat = "\"" key "\"[ \t]*:[ \t]*\""
+                if (match(chunk, pat "(\\\\.|[^\"\\\\])*\"")) {
+                    s = substr(chunk, RSTART, RLENGTH)
+                    sub("^" pat, "", s); sub(/"$/, "", s)
+                    return unesc(s)
+                }
+                return ""
+            }
+            function get_num(chunk, key,    pat, s) {
+                pat = "\"" key "\"[ \t]*:[ \t]*[0-9]+"
+                if (match(chunk, pat)) {
+                    s = substr(chunk, RSTART, RLENGTH)
+                    sub("^.*:[ \t]*", "", s)
+                    return s
+                }
+                return ""
+            }
+            function get_authors(chunk,    s, out, pat, m) {
+                out = ""
+                s = chunk
+                pat = "\"display_name\"[ \t]*:[ \t]*\"(\\\\.|[^\"\\\\])*\""
+                while (match(s, /"author"[ \t]*:[ \t]*\{[^}]*\}/)) {
+                    a_blk = substr(s, RSTART, RLENGTH)
+                    s = substr(s, RSTART + RLENGTH)
+                    m = get_str(a_blk, "display_name")
+                    if (m != "") out = (out == "" ? m : out ", " m)
+                }
+                return out
+            }
+            { raw = raw $0 "\n" }
+            END {
+                if (mode == "detailed") {
+                    id = get_str(raw, "id")
+                    sub(/^https:\/\/openalex\.org\//, "", id)
+                    if (id == "") exit 1
+                    title = get_str(raw, "display_name")
+                    if (title == "") title = get_str(raw, "title")
+                    pub = get_str(raw, "publication_date"); if (pub == "") pub = "N/A"
+                    doi = get_str(raw, "doi"); if (doi == "") doi = "N/A"
+                    wtype = get_str(raw, "type"); if (wtype == "") wtype = "N/A"
+                    cites = get_num(raw, "cited_by_count"); if (cites == "") cites = "0"
+                    pdf = get_str(raw, "pdf_url"); if (pdf == "") pdf = get_str(raw, "oa_url")
+                    authors = get_authors(raw); if (authors == "") authors = "Unknown Author"
+                    printf "ID:        %s\nTitle:     %s\nPublished: %s\nAuthors:   %s\nType:      %s\nCitations: %s\nDOI:       %s\nURL:       https://openalex.org/%s\nPDF:       %s\n", id, title, pub, authors, wtype, cites, doi, id, (pdf ? pdf : "N/A")
+                    exit 0
+                }
+                if (mode == "pdf") {
+                    pdf = get_str(raw, "pdf_url")
+                    if (pdf == "") pdf = get_str(raw, "oa_url")
+                    doi = get_str(raw, "doi")
+                    printf "%s\t%s\n", (pdf != "" ? pdf : "-"), (doi != "" ? doi : "-")
+                    exit 0
+                }
+                n = split(raw, items, /"id"[ \t]*:[ \t]*"https:\/\/openalex\.org\/W/)
+                if (n <= 1) exit 1
+                for (i = 2; i <= n; i++) {
+                    c = "\"id\":\"https://openalex.org/W" items[i]
+                    id = get_str(c, "id")
+                    sub(/^https:\/\/openalex\.org\//, "", id)
+                    title = get_str(c, "display_name")
+                    if (title == "") title = get_str(c, "title")
+                    if (title == "") continue
+                    pub = get_str(c, "publication_date")
+                    if (pub == "") pub = get_num(c, "publication_year")
+                    if (pub == "") pub = "N/A"
+                    authors = get_authors(c)
+                    if (authors == "") authors = "Unknown Author"
+                    printf "[%s] (%s) %s   %s\n", id, pub, title, authors
+                }
+            }
+        '
+    }
+
+    __preprint_provider_openalex_list() {
+        local max="${1:-0}" sort_by="${2:-time}" reverse="${3:-0}"
+        local per_page=$(( max > 0 && max <= 200 ? max : 100 ))
+        local profile orcid filter=""
+        profile="${OPENALEX_PROFILE:-$(__preprint_get_conf openalex profile)}"
+        orcid="${OPENALEX_ORCID:-$(__preprint_get_conf openalex orcid)}"
+        [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid orcid)"
+
+        if [[ -n "$profile" ]]; then
+            filter="author.id:${profile}"
+        elif [[ -n "$orcid" ]]; then
+            filter="author.orcid:${orcid}"
+        else
+            __log "Set your OpenAlex Author ID (e.g. A5023888391) or ORCID iD first:
+  preprint database set -d openalex --profile <A...>
+  OR
+  preprint database set -d openalex --orcid <0000-0000-0000-0000>" -t error -l preprint
+            return 1
+        fi
+
+        curl -fsSL "https://api.openalex.org/works?filter=${filter}&per-page=${per_page}&sort=publication_date:desc" 2>/dev/null | __preprint_parse_openalex "compact" || echo "No entries found in OpenAlex."
+    }
+
+    __preprint_provider_openalex_get() {
+        local id="$1"
+        curl -fsSL "https://api.openalex.org/works/${id}" 2>/dev/null | __preprint_parse_openalex "detailed" || echo "No entry found in OpenAlex for '$id'."
+    }
+
+    __preprint_provider_openalex_search() {
+        local term="$1" per_page="${2:-50}" page="${3:-1}" sort_by="${4:-time}" reverse="${5:-0}"
+        (( per_page > 200 )) && per_page=200
+        local enc_term=$(__preprint_urlencode "$term")
+        curl -fsSL "https://api.openalex.org/works?search=${enc_term}&per-page=${per_page}&page=${page}" 2>/dev/null | __preprint_parse_openalex "compact" || echo "No entries found in OpenAlex."
+    }
+
+    __preprint_provider_openalex_download() {
+        local id="$1" out_path="${2:-}"
+        local json pdf_url doi_url
+        json=$(curl -fsSL "https://api.openalex.org/works/${id}" 2>/dev/null)
+        read -r pdf_url doi_url < <(__preprint_parse_openalex "pdf" <<< "$json")
+        if [[ -n "$pdf_url" && "$pdf_url" != "-" ]]; then
+            __preprint_save_pdf_stream "$pdf_url" "openalex_${id}.pdf" "$out_path"
+            return $?
+        elif [[ -n "$doi_url" && "$doi_url" != "-" ]]; then
+            __preprint_resolve_doi_pdf "$doi_url" "$out_path" "openalex_${id}.pdf"
+            return $?
+        fi
+        __log "No Open-Access PDF available for OpenAlex work '$id'." -t error -l preprint
+        return 1
+    }
+}

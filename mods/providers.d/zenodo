@@ -4,7 +4,7 @@ __zenodo__() {
     __preprint_register_provider "zenodo" \
         --pagination "page" \
         --requires-file "true" \
-        --desc "Zenodo open research repository (REST API v1)"
+        --desc "Zenodo open research repository (stage drafts via send, publish via publish)"
 
     __preprint_zenodo_base_url() {
         local sb
@@ -20,17 +20,14 @@ __zenodo__() {
         local mode="${1:-list}"
         LC_ALL=C awk -v mode="$mode" '
             function unesc(s) {
-                gsub(/\\"/, "\"", s)
-                gsub(/\\\\/, "\\", s)
-                gsub(/\\n/, " ", s)
+                gsub(/\\"/, "\"", s); gsub(/\\\\/, "\\", s); gsub(/\\n/, " ", s)
                 return s
             }
             function get_str(chunk, key,    pat, s) {
                 pat = "\"" key "\"[ \t]*:[ \t]*\""
                 if (match(chunk, pat "(\\\\.|[^\"\\\\])*\"")) {
                     s = substr(chunk, RSTART, RLENGTH)
-                    sub("^" pat, "", s)
-                    sub(/"$/, "", s)
+                    sub("^" pat, "", s); sub(/"$/, "", s)
                     return unesc(s)
                 }
                 return ""
@@ -44,6 +41,12 @@ __zenodo__() {
                 }
                 return ""
             }
+            function is_draft(chunk,    st) {
+                st = get_str(chunk, "state")
+                if (st == "unsubmitted" || st == "inprogress") return 1
+                if (chunk ~ /"submitted"[ \t]*:[ \t]*false/) return 1
+                return 0
+            }
             function get_creators(chunk,    s, out, name_pat, m) {
                 out = ""
                 if (match(chunk, /"creators"[ \t]*:[ \t]*\[[^\]]*\]/)) {
@@ -52,8 +55,7 @@ __zenodo__() {
                     while (match(s, name_pat)) {
                         m = substr(s, RSTART, RLENGTH)
                         s = substr(s, RSTART + RLENGTH)
-                        sub(/^"name"[ \t]*:[ \t]*"/, "", m)
-                        sub(/"$/, "", m)
+                        sub(/^"name"[ \t]*:[ \t]*"/, "", m); sub(/"$/, "", m)
                         out = (out == "" ? unesc(m) : out ", " unesc(m))
                     }
                 }
@@ -66,6 +68,12 @@ __zenodo__() {
                     bucket = get_str(raw, "bucket")
                     if (id == "") exit 1
                     print id, bucket
+                    exit 0
+                }
+                if (mode == "check_status") {
+                    if (is_draft(raw)) print "draft"
+                    else if (raw ~ /"submitted"[ \t]*:[ \t]*true/ || get_str(raw, "state") == "done") print "published"
+                    else print "unknown"
                     exit 0
                 }
                 if (mode == "detailed") {
@@ -81,13 +89,12 @@ __zenodo__() {
                     html = get_str(raw, "html"); if (html == "") html = "N/A"
                     desc = get_str(raw, "description")
                     creators = get_creators(raw)
-                    printf "ID:          %s\nDOI:         %s\nTitle:       %s\nPublished:   %s\nAuthors:     %s\nURL:         %s\nDescription:\n  %s\n", id, doi, title, pub, creators, html, desc
+                    st = (is_draft(raw) ? "DRAFT" : "PUBLISHED")
+                    printf "ID:          %s\nStatus:      %s\nDOI:         %s\nTitle:       %s\nPublished:   %s\nAuthors:     %s\nURL:         %s\nDescription:\n  %s\n", id, st, doi, title, pub, creators, html, desc
                     exit 0
                 }
                 n = split(raw, recs, /"created"[ \t]*:/)
-                if (n <= 1) {
-                    exit 1
-                }
+                if (n <= 1) exit 1
                 for (i = 2; i <= n; i++) {
                     c = "\"created\":" recs[i]
                     id = get_num(c, "id")
@@ -97,7 +104,8 @@ __zenodo__() {
                     if (pub == "") pub = "N/A"
                     creators = get_creators(c)
                     if (creators == "") creators = "Unknown Author"
-                    printf "[%s] (%s) %s   %s\n", id, pub, title, creators
+                    badge = (mode == "list" && is_draft(c) ? "[DRAFT] " : "")
+                    printf "[%s] (%s) %s%s   %s\n", id, pub, badge, title, creators
                 }
             }
         '
@@ -123,8 +131,7 @@ __zenodo__() {
                 s = raw
                 while (match(s, /"self"[ \t]*:[ \t]*"https?:\/\/[^"]+\/files\/[^"]+"/)) {
                     u = substr(s, RSTART, RLENGTH)
-                    sub(/^"self"[ \t]*:[ \t]*"/, "", u)
-                    sub(/"$/, "", u)
+                    sub(/^"self"[ \t]*:[ \t]*"/, "", u); sub(/"$/, "", u)
                     print u; exit
                 }
             }
@@ -156,7 +163,12 @@ __zenodo__() {
         base_url="$(__preprint_zenodo_base_url)"
         token="${ZENODO_TOKEN:-$(__preprint_get_conf zenodo token)}"
         [[ -n "$token" ]] && auth_header=(-H "Authorization: Bearer $token")
-        curl -sSL "${auth_header[@]}" "${base_url}/records/${id}" | __preprint_parse_zenodo_json "detailed"
+        local resp
+        resp=$(curl -sSL "${auth_header[@]}" "${base_url}/deposit/depositions/${id}" 2>/dev/null)
+        if [[ -z "$resp" || "$resp" == *"\"status\": 40"* ]]; then
+            resp=$(curl -sSL "${auth_header[@]}" "${base_url}/records/${id}" 2>/dev/null)
+        fi
+        __preprint_parse_zenodo_json "detailed" <<< "$resp"
     }
 
     __preprint_provider_zenodo_search() {
@@ -170,10 +182,12 @@ __zenodo__() {
         curl -sSL "${base_url}/records?q=${enc_term}&sort=${zenodo_sort}&size=${page_size}&page=${page}" | __preprint_parse_zenodo_json "search" || echo "No records found."
     }
 
+    # Stages a new draft deposition on Zenodo
     __preprint_provider_zenodo_send() {
         local file="$PREPRINT_SEND_FILE" meta="$PREPRINT_SEND_META" title="$PREPRINT_SEND_TITLE"
         local author="$PREPRINT_SEND_AUTHOR" abstract="$PREPRINT_SEND_ABSTRACT"
-        local publish="${PREPRINT_SEND_PUBLISH:-0}" doi="$PREPRINT_SEND_DOI"
+        local doi="$PREPRINT_SEND_DOI" pub_date="$PREPRINT_SEND_DATE"
+
         local token base_url
         token="${ZENODO_TOKEN:-$(__preprint_get_conf zenodo token)}"
         base_url="$(__preprint_zenodo_base_url)"
@@ -182,17 +196,20 @@ __zenodo__() {
             return 1
         fi
 
+        [[ -z "$title" ]] && title="$(basename "${file%.*}")"
+        [[ -z "$author" ]] && author="${USER:-Anonymous}"
+        [[ -z "$abstract" ]] && abstract="Preprint uploaded via omni preprint tool."
+        [[ -z "$pub_date" ]] && printf -v pub_date "%(%Y-%m-%d)T" -1
+
         local meta_payload="{}"
-        if [[ -n "$meta" && -f "$meta" ]]; then
+        if __preprint_is_raw_payload_meta "$meta"; then
             meta_payload=$(<"$meta")
         else
-            [[ -z "$title" ]] && title="$(basename "${file%.*}")"
-            [[ -z "$author" ]] && author="${USER:-Anonymous}"
-            [[ -z "$abstract" ]] && abstract="Preprint uploaded via omni preprint tool."
             local esc_title esc_desc esc_doi creators_json=""
             esc_title=$(__preprint_json_escape "$title")
             esc_desc=$(__preprint_json_escape "$abstract")
             esc_doi=$(__preprint_json_escape "$doi")
+
             local IFS=';' a
             for a in $author; do
                 a="${a#"${a%%[![:space:]]*}"}"
@@ -200,12 +217,13 @@ __zenodo__() {
                 [[ -z "$a" ]] && continue
                 creators_json+="${creators_json:+,}{\"name\":\"$(__preprint_json_escape "$a")\"}"
             done
+
             local doi_field=""
             [[ -n "$esc_doi" ]] && doi_field=",\"doi\":\"${esc_doi}\""
             meta_payload="{\"metadata\":{\"title\":\"${esc_title}\",\"upload_type\":\"publication\",\"publication_type\":\"preprint\",\"description\":\"${esc_desc}\",\"creators\":[${creators_json}]${doi_field}}}"
         fi
 
-        __log "Creating Zenodo deposition..." -t info -l preprint
+        __log "Creating Zenodo draft deposition..." -t info -l preprint
         local create_resp dep_id bucket_url
         create_resp=$(curl -sSL -X POST "${base_url}/deposit/depositions" \
             -H "Authorization: Bearer $token" \
@@ -218,7 +236,7 @@ __zenodo__() {
             return 1
         }
 
-        __log "Uploading file '$(basename "$file")' to Zenodo bucket (ID: $dep_id)..." -t info -l preprint
+        __log "Uploading file '$(basename "$file")' to Zenodo draft bucket (ID: $dep_id)..." -t info -l preprint
         if [[ -n "$bucket_url" ]]; then
             curl -sSL -X PUT "${bucket_url}/$(basename "$file")" \
                 -H "Authorization: Bearer $token" \
@@ -230,13 +248,63 @@ __zenodo__() {
                 -F "file=@${file}" >/dev/null
         fi
 
-        if (( publish == 1 )); then
-            __log "Publishing Zenodo deposition $dep_id..." -t info -l preprint
-            curl -sSL -X POST "${base_url}/deposit/depositions/${dep_id}/actions/publish" \
-                -H "Authorization: Bearer $token" >/dev/null
-            __log "Zenodo record published! ID: $dep_id" -t success -l preprint
+        __preprint_draft_save "zenodo" "$dep_id" "$pub_date" "$title" "${author//;/, }" "-" "-"
+        __log "Zenodo draft staged! ID: $dep_id (Run 'preprint publish $dep_id -d zenodo' to publish)" -t success -l preprint
+    }
+
+    # Publishes ONLY an unsubmitted draft deposition on Zenodo
+    __preprint_provider_zenodo_publish() {
+        local dep_id="$1"
+        [[ -z "$dep_id" ]] && { __log "Deposition ID required: preprint publish <id> -d zenodo" -t error -l preprint; return 1; }
+
+        local token base_url
+        token="${ZENODO_TOKEN:-$(__preprint_get_conf zenodo token)}"
+        base_url="$(__preprint_zenodo_base_url)"
+        if [[ -z "$token" ]]; then
+            __log "Zenodo token missing." -t error -l preprint
+            return 1
+        fi
+
+        local dep_json status
+        dep_json=$(curl -sSL -H "Authorization: Bearer $token" "${base_url}/deposit/depositions/${dep_id}" 2>/dev/null)
+        status=$(__preprint_parse_zenodo_json "check_status" <<< "$dep_json")
+        if [[ "$status" == "published" ]]; then
+            __log "Zenodo deposition '$dep_id' is already published." -t error -l preprint
+            return 1
+        fi
+
+        __log "Publishing Zenodo draft deposition '$dep_id'..." -t info -l preprint
+        local resp http_code
+        resp=$(curl -sS -w "\n%{http_code}" -X POST "${base_url}/deposit/depositions/${dep_id}/actions/publish" \
+            -H "Authorization: Bearer $token" 2>&1)
+        http_code="${resp##*$'\n'}"
+        if [[ "$http_code" =~ ^20[012]$ ]]; then
+            __log "Zenodo record '$dep_id' published!" -t success -l preprint
+            return 0
         else
-            __log "Zenodo draft created! ID: $dep_id (Review at ${base_url%/api}/deposit/${dep_id})" -t success -l preprint
+            __log "Failed to publish Zenodo draft '$dep_id' (HTTP $http_code)." -t error -l preprint
+            echo "${resp%$'\n'*}" >&2
+            return 1
+        fi
+    }
+
+    __preprint_provider_zenodo_rm() {
+        local id="$1"
+        local token base_url
+        token="${ZENODO_TOKEN:-$(__preprint_get_conf zenodo token)}"
+        base_url="$(__preprint_zenodo_base_url)"
+        if [[ -z "$token" || -z "$id" ]]; then
+            __log "Zenodo token and deposition ID required." -t error -l preprint
+            return 1
+        fi
+        local resp http_code
+        resp=$(curl -sS -w "\n%{http_code}" -X DELETE -H "Authorization: Bearer $token" "${base_url}/deposit/depositions/${id}" 2>&1)
+        http_code="${resp##*$'\n'}"
+        if [[ "$http_code" =~ ^20[04]$ ]]; then
+            __log "Removed Zenodo deposition '$id'." -t success -l preprint
+        else
+            __log "Failed to remove Zenodo deposition '$id' (HTTP $http_code)." -t error -l preprint
+            return 1
         fi
     }
 }

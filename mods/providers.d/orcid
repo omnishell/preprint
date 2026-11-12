@@ -4,7 +4,7 @@ __orcid__() {
     __preprint_register_provider "orcid" \
         --pagination "offset" \
         --requires-file "false" \
-        --desc "ORCID Researcher Registry (v3.0 Public & Member API)"
+        --desc "ORCID Researcher Registry (v3.0 Public & Member API: list/add/rm works)"
 
     __preprint_orcid_base_url() {
         local sb
@@ -76,15 +76,16 @@ __orcid__() {
                 else if (hal_id != "") print "hal", hal_id
                 else if (ext_prov != "") print ext_prov, ext_val
                 else if (work_url ~ /\.pdf$/ || work_url ~ /arxiv\.org\/abs\//) print "url", work_url
-                else if (doi_id ~ /10\.48550\/arXiv\./) {
-                    sub(/^.*arXiv\./, "", doi_id)
-                    print "arxiv", doi_id
-                } else if (work_url != "") print "url", work_url
+                else if (doi_id != "") print "doi", doi_id
+                else if (work_url != "") print "url", work_url
             }
         ' <<< "$xml")
 
         if __preprint_is_provider "$resolved_type"; then
             __preprint_download_entry "$resolved_type" "$resolved_val" "$out_path"
+            return $?
+        elif [[ "$resolved_type" == "doi" ]]; then
+            __preprint_resolve_doi_pdf "$resolved_val" "$out_path" "orcid_${put_code}.pdf"
             return $?
         elif [[ "$resolved_type" == "url" ]]; then
             local pdf_url="${resolved_val/\/abs\//\/pdf\/}"
@@ -112,15 +113,18 @@ __orcid__() {
         works="$(__preprint_sort_lines "$sort_by" "$reverse" <<< "$works")"
         work_out=$(printf '%s\n' "$works" | fzf --expect=ctrl-d --header="[ID] (Date) Title   Authors  |  Enter: details  |  Ctrl-D: download PDF" --prompt="Works for $target > " --height=50% --layout=reverse --border)
         [[ -z "$work_out" ]] && return 0
+
         work_key="${work_out%%$'\n'*}"
         work_sel="${work_out#*$'\n'}"
         [[ "$work_key" == "$work_out" ]] && { work_key=""; work_sel="$work_out"; }
         [[ -z "$work_sel" ]] && return 0
+
         if [[ "$work_sel" =~ ^\[([^]]+)\] ]]; then
             put_code="${BASH_REMATCH[1]}"
         else
             put_code="${work_sel%% *}"
         fi
+
         if [[ "$work_key" == "ctrl-d" ]]; then
             __preprint_provider_orcid_download "${target}:${put_code}" "$out_path"
             return $?
@@ -209,7 +213,6 @@ __orcid__() {
             orcid="${target%%:*}"
             put_code="${target#*:}"
         fi
-
         if [[ -z "$orcid" ]]; then
             __log "ORCID iD required (configure via 'preprint database set -d orcid --orcid <id>' or pass '<orcid>:<put-code>')." -t error -l preprint
             return 1
@@ -255,6 +258,7 @@ __orcid__() {
         local base_url enc_term
         base_url="$(__preprint_orcid_base_url)"
         enc_term=$(__preprint_urlencode "$term")
+
         curl -sSL -H "Accept: application/vnd.orcid+xml" "${base_url}/expanded-search/?q=${enc_term}&start=${start}&rows=${rows}" | LC_ALL=C awk '
             function strip_tag(s) {
                 gsub(/<[^>]+>/, "", s)
@@ -308,7 +312,7 @@ __orcid__() {
         local content_type="application/vnd.orcid+json"
         local payload=""
         local meta_source=""
-        if [[ -n "$meta" && -f "$meta" ]]; then
+        if __preprint_is_raw_payload_meta "$meta"; then
             meta_source="$meta"
         elif [[ -n "$file" && ( "$file" == *.json || "$file" == *.xml ) ]]; then
             meta_source="$file"
@@ -381,15 +385,10 @@ __orcid__() {
             local esc_wtype=$(__preprint_json_escape "${work_type:-preprint}")
             payload="{\"title\":{\"title\":{\"value\":\"${esc_title}\"}},\"type\":\"${esc_wtype}\",\"publication-date\":${pub_date_json},\"external-ids\":{\"external-id\":[${ext_ids}]}"
 
-            if [[ -n "$abstract" ]]; then
-                payload+=",\"short-description\":\"$(__preprint_json_escape "$abstract")\""
-            fi
-            if [[ -n "$journal" ]]; then
-                payload+=",\"journal-title\":{\"value\":\"$(__preprint_json_escape "$journal")\"}"
-            fi
-            if [[ -n "$url" ]]; then
-                payload+=",\"url\":{\"value\":\"$(__preprint_json_escape "$url")\"}"
-            fi
+            [[ -n "$abstract" ]] && payload+=",\"short-description\":\"$(__preprint_json_escape "$abstract")\""
+            [[ -n "$journal" ]] && payload+=",\"journal-title\":{\"value\":\"$(__preprint_json_escape "$journal")\"}"
+            [[ -n "$url" ]] && payload+=",\"url\":{\"value\":\"$(__preprint_json_escape "$url")\"}"
+
             if [[ -n "$author" ]]; then
                 local contribs="" idx=0 IFS=';' a
                 for a in $author; do
@@ -415,11 +414,44 @@ __orcid__() {
             -d "$payload" 2>&1)
         http_code="${resp##*$'\n'}"
         local body="${resp%$'\n'*}"
+
         if [[ "$http_code" =~ ^20[012]$ ]]; then
             __log "Work successfully added to ORCID ($orcid)!" -t success -l preprint
         else
             __log "ORCID submission failed (HTTP $http_code)." -t error -l preprint
             echo "$body" >&2
+            return 1
+        fi
+    }
+
+    __preprint_provider_orcid_rm() {
+        local put_code="$1"
+        local orcid token api_url
+        orcid="${ORCID_ID:-$(__preprint_get_conf orcid orcid)}"
+        [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid profile)"
+        token="${ORCID_TOKEN:-$(__preprint_get_conf orcid token)}"
+        api_url="$(__preprint_orcid_api_url)"
+
+        if [[ "$put_code" == *":"* ]]; then
+            orcid="${put_code%%:*}"
+            put_code="${put_code#*:}"
+        fi
+
+        if [[ -z "$orcid" || -z "$token" || -z "$put_code" ]]; then
+            __log "ORCID iD, OAuth token, and work put-code required to remove an ORCID work." -t error -l preprint
+            return 1
+        fi
+
+        local resp http_code
+        resp=$(curl -sS -w "\n%{http_code}" -X DELETE "${api_url}/${orcid}/work/${put_code}" \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.orcid+json" 2>&1)
+        http_code="${resp##*$'\n'}"
+        if [[ "$http_code" =~ ^20[04]$ ]]; then
+            __log "Removed work put-code '$put_code' from ORCID ($orcid)." -t success -l preprint
+        else
+            __log "Failed to remove work '$put_code' from ORCID (HTTP $http_code)." -t error -l preprint
+            echo "${resp%$'\n'*}" >&2
             return 1
         fi
     }

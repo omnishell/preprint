@@ -16,44 +16,48 @@ ABOUT:
     omni academic preprint & publication manager
 
 USAGE:
-    preprint database <ls|set|rm> [-d/--database <provider>] [options]
-    preprint list -d/--database <provider> [-s/--sort <time|alpha>] [-r/--reverse] [-n/--max <N>]
+    preprint profile <list|add|rm|get|edit> <provider> [options]
+    preprint database <ls|set|rm> [<provider>] [options]
     preprint get [<id>] -d/--database <provider> [-D/--download] [-o/--output <path>] [-s/--sort <time|alpha>] [-r/--reverse]
-    preprint search <term> -d/--database <provider> [-D/--download] [-o/--output <path>] [-s/--sort <time|alpha>] [-r/--reverse] [-n/--max <page_size>] [--no-fzf]
+    preprint search <terms...> [-d/--database] <provider> [-D/--download] [-o/--output <path>] [-s/--sort <time|alpha>] [-r/--reverse] [-n/--max <page_size>] [--no-fzf]
     preprint download [<id>] -d/--database <provider> [-o/--output <path>]
     preprint send [<file>] -d/--database <provider> [options]
+    preprint publish [<id>] -d/--database <provider>
 
 REGISTERED PROVIDERS:
     ${dbs_csv}
 $(__preprint_providers_help_table)
 
-DOWNLOADING PDFS:
-    - Inside fzf ('search' or 'get'): Press Ctrl-D to immediately download the highlighted entry's PDF,
-      or press Enter to view details and confirm download.
-    - CLI Flags: Pass -D/--download (and optionally -o/--output <dir_or_file>) to 'search' or 'get'.
+PROFILE COMMANDS:
+    profile list <provider> [-s <time|alpha>] [-r] [-n <N>]   List publications & [DRAFT] entries in your profile
+    profile add <provider> [<file>] [send-options]            Add/stage a work entry in your profile
+    profile rm <provider> [<entry_id>]                        Remove/delete a work or draft entry from your profile
+    profile get [<provider>]                                  Inspect profile settings & credentials for <provider>
+    profile edit <provider> [options]                         Edit profile settings (interactive or via flags)
 
-SORTING OPTIONS (for 'list', 'get', 'search'):
-    -s, --sort <criteria>   Sort by 'time' (default: newest first) or 'alpha' / 'alphabetically' (A-Z)
-    -r, --reverse           Reverse the sort order (oldest first for 'time', Z-A for 'alpha')
+WORKFLOW (SEND -> LIST DRAFTS -> PUBLISH):
+    1. Stage Draft:   preprint send paper.pdf -d <hexagon|hal|zenodo|...> [options]
+    2. Inspect List:  preprint profile list <provider>   (unpublished items are marked with [DRAFT])
+    3. Publish Draft: preprint publish [<id>] -d <provider> (publishes only [DRAFT] entries; omit <id> for fzf)
 
 DATABASE COMMANDS:
-    database ls                                List registered providers and status
-    database set -d <provider> [options]       Configure profile & credentials for a provider
-    database rm -d <provider>                  Remove configuration for a provider
+    database ls                        List registered providers and status
+    database set <provider> [options]  Configure profile & credentials for a provider
+    database rm <provider>             Remove configuration for a provider
 
-OPTIONS (for 'database set'):
+OPTIONS (for 'profile edit' / 'database set'):
     -d, --database <prov>   Target provider (${dbs_csv})
-    --profile <id>          Profile ID (Author ID, idHAL, ORCID iD, or User ID)
+    --profile <id>          Profile ID (Author ID, idHAL, ORCID iD, Scholar ID, S2 ID, OpenAlex ID, DBLP PID)
     --orcid <id>            ORCID iD (e.g., 0000-0002-1825-0097)
-    --token <token>         API Token / OAuth Bearer token
+    --token <token>         API Token / OAuth Bearer token / API Key
     --user <user>           Account username/email
     --pass <pass>           Account password
     --sandbox               Use sandbox/preprod API endpoints
     --no-sandbox            Use production API endpoints (default)
 
-OPTIONS (for 'send'):
+OPTIONS (for 'send' & 'profile add'):
     -d, --database <prov>   Target provider (${dbs_csv})
-    -m, --meta <file>       Custom metadata file (JSON/XML) instead of CLI flags
+    -m, --meta <file>       Custom metadata file (YAML/Key-Value, JSON, or XML)
     -t, --title <title>     Title of the paper/work
     -a, --author <authors>  Authors separated by ';' (e.g., "John Doe; Jane Smith")
     -A, --abstract <text>   Abstract or short description
@@ -67,7 +71,6 @@ OPTIONS (for 'send'):
     --journal <name>        Journal or host venue title
     --type <type>           Work type (default: "preprint"; e.g., "journal-article")
     --date <YYYY[-MM[-DD]]> Publication date (default: today)
-    --publish               Immediately publish deposit
 EOF
     }
 
@@ -80,11 +83,14 @@ EOF
         shift
 
         case "$cmd" in
-            database|db)
-                __preprint_database "$@"
+            profile)
+                __preprint_profile "$@"
                 ;;
             list|ls)
-                __preprint_list "$@"
+                __preprint_profile_list "$@"
+                ;;
+            database|db)
+                __preprint_database "$@"
                 ;;
             get)
                 __preprint_get "$@"
@@ -95,8 +101,14 @@ EOF
             download|dl)
                 __preprint_get -D "$@"
                 ;;
-            send|push|publish)
+            send|push)
                 __preprint_send "$@"
+                ;;
+            publish)
+                __preprint_publish "$@"
+                ;;
+            rm|delete)
+                __preprint_profile_rm "$@"
                 ;;
             *)
                 __log "Unknown command '$cmd'. Try 'preprint --help'." -t error -l preprint
@@ -113,7 +125,7 @@ EOF
         local dbs="${PREPRINT_PROVIDERS[*]}"
 
         if [[ $COMP_CWORD -eq 1 ]]; then
-            COMPREPLY=( $(compgen -W "database list get search download send --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "profile list database get search download send publish rm --help -h" -- "$cur") )
             return 0
         fi
 
@@ -121,12 +133,10 @@ EOF
             COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
             return 0
         fi
-
         if [[ "$prev" == "-s" || "$prev" == "--sort" ]]; then
             COMPREPLY=( $(compgen -W "time alpha alphabetically" -- "$cur") )
             return 0
         fi
-
         if [[ "$prev" == "-m" || "$prev" == "--meta" || "$prev" == "-o" || "$prev" == "--output" ]]; then
             COMPREPLY=( $(compgen -f -- "$cur") )
             return 0
@@ -138,6 +148,35 @@ EOF
         done
 
         case "$cmd" in
+            profile)
+                if [[ $COMP_CWORD -eq 2 ]]; then
+                    COMPREPLY=( $(compgen -W "list ls add rm remove delete get edit set" -- "$cur") )
+                elif [[ $COMP_CWORD -eq 3 && "$cur" != -* ]]; then
+                    COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
+                elif [[ "$cur" == -* ]]; then
+                    case "$subcmd" in
+                        list|ls)
+                            COMPREPLY=( $(compgen -W "-d --database -s --sort -r --reverse -n --max" -- "$cur") )
+                            ;;
+                        add)
+                            COMPREPLY=( $(compgen -W "-d --database -m --meta -t --title -a --author -A --abstract -c --category --id --doi --url --journal --type --date $ext_id_flags" -- "$cur") )
+                            ;;
+                        rm|remove|delete|get)
+                            COMPREPLY=( $(compgen -W "-d --database" -- "$cur") )
+                            ;;
+                        edit|set)
+                            COMPREPLY=( $(compgen -W "-d --database --profile --orcid --token --user --pass --sandbox --no-sandbox" -- "$cur") )
+                            ;;
+                    esac
+                fi
+                ;;
+            list|ls)
+                if [[ "$cur" == -* ]]; then
+                    COMPREPLY=( $(compgen -W "-d --database -s --sort -r --reverse -n --max" -- "$cur") )
+                else
+                    COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
+                fi
+                ;;
             database|db)
                 if [[ $COMP_CWORD -eq 2 ]]; then
                     COMPREPLY=( $(compgen -W "ls set rm" -- "$cur") )
@@ -151,11 +190,6 @@ EOF
                     COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
                 fi
                 ;;
-            list|ls)
-                if [[ "$cur" == -* ]]; then
-                    COMPREPLY=( $(compgen -W "-d --database -s --sort -r --reverse -n --max" -- "$cur") )
-                fi
-                ;;
             get|download|dl)
                 if [[ "$cur" == -* ]]; then
                     COMPREPLY=( $(compgen -W "-d --database -D --download -o --output -s --sort -r --reverse -n --max" -- "$cur") )
@@ -164,13 +198,20 @@ EOF
             search)
                 if [[ "$cur" == -* ]]; then
                     COMPREPLY=( $(compgen -W "-d --database -D --download -o --output -s --sort -r --reverse -n --max -l --no-fzf" -- "$cur") )
+                elif [[ $COMP_CWORD -gt 2 ]]; then
+                    COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
                 fi
                 ;;
-            send|push|publish)
+            send|push)
                 if [[ "$cur" == -* ]]; then
-                    COMPREPLY=( $(compgen -W "-d --database -m --meta -t --title -a --author -A --abstract -c --category --id --doi --url --journal --type --date --publish $ext_id_flags" -- "$cur") )
+                    COMPREPLY=( $(compgen -W "-d --database -m --meta -t --title -a --author -A --abstract -c --category --id --doi --url --journal --type --date $ext_id_flags" -- "$cur") )
                 else
                     COMPREPLY=( $(compgen -f -- "$cur") )
+                fi
+                ;;
+            publish)
+                if [[ "$cur" == -* ]]; then
+                    COMPREPLY=( $(compgen -W "-d --database" -- "$cur") )
                 fi
                 ;;
         esac

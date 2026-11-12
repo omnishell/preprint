@@ -3,8 +3,8 @@
 __hal__() {
     __preprint_register_provider "hal" \
         --pagination "offset" \
-        --requires-file "true" \
-        --desc "HAL Open Archive (Search API & SWORD v2 TEI deposit)"
+        --requires-file "false" \
+        --desc "HAL Open Archive (stage drafts via send, finalize via publish)"
 
     __preprint_hal_sword_url() {
         local sb
@@ -43,6 +43,7 @@ __hal__() {
                     count++
                     if (hid == "") hid = "N/A"
                     if (title == "") title = "Untitled"
+
                     date = pdate
                     if (date == "") date = pubdate
                     if (date == "") date = substr(subdate, 1, 10)
@@ -51,6 +52,7 @@ __hal__() {
                     if (date == "") date = "N/A"
                     if (length(date) == 4 && date ~ /^[0-9]{4}$/) date = date "-01-01"
                     if (length(date) == 7 && date ~ /^[0-9]{4}-[0-9]{2}$/) date = date "-01"
+
                     if (authors == "") authors = "Unknown Author"
                     if (pdf == "" && ffirst != "") pdf = ffirst
                     if (pdf == "" && arx != "") pdf = "https://arxiv.org/pdf/" arx ".pdf (via arXiv)"
@@ -89,6 +91,7 @@ __hal__() {
                     val = $0
                     sub(/<\/(str|date|int)$/, "", val)
                     val = unesc_xml(val)
+
                     if (cur_field == "halId_s")                  hid = val
                     else if (cur_field == "producedDate_s")      pdate = val
                     else if (cur_field == "publicationDate_s")   pubdate = val
@@ -104,6 +107,7 @@ __hal__() {
                     else if (cur_field == "title_s")             { if (title == "") title = val }
                     else if (cur_field == "abstract_s")          { if (abstract == "") abstract = val }
                     else if (cur_field == "authFullName_s")      { if (val != "") authors = (authors == "" ? val : authors ", " val) }
+
                     cur_field = ""
                 }
             }
@@ -158,7 +162,7 @@ __hal__() {
             pdf_url=$(LC_ALL=C awk '
                 /citation_pdf_url/ {
                     if (match($0, /content="https?:\/\/[^"]+"/)) {
-                        u = substr($0, RSTART + 9, RLENGTH - 10)
+                        u = substr(0, RSTART + 9, RLENGTH - 10)
                         print u; exit
                     }
                 }
@@ -170,11 +174,7 @@ __hal__() {
             ' <<< "$page_html")
 
             if [[ -z "$pdf_url" ]]; then
-                if [[ "$submit_type" == "notice" ]]; then
-                    __log "HAL entry '$base_id' is a metadata-only citation notice (no PDF file uploaded to HAL)." -t warning -l preprint
-                else
-                    __log "No PDF file is publicly available for HAL entry '$base_id' (it may be a metadata notice or under embargo)." -t error -l preprint
-                fi
+                __log "No PDF file is publicly available for HAL entry '$base_id'." -t error -l preprint
                 return 1
             fi
         fi
@@ -200,7 +200,16 @@ __hal__() {
         elif [[ -n "$user" && "$user" != *"@"* ]]; then
             query="authIdHal_s:$(__preprint_urlencode "$user")"
         else
-            __log "Set your HAL profile ID (idHAL) or ORCID iD first:   preprint database set -d hal --profile <idhal>   OR   preprint database set -d hal --orcid <0000-0000-0000-0000>" -t error -l preprint
+            local has_drafts
+            has_drafts="$(__preprint_draft_list_Formatted hal)"
+            if [[ -n "$has_drafts" ]]; then
+                echo "$has_drafts"
+                return 0
+            fi
+            __log "Set your HAL profile ID (idHAL) or ORCID iD first:
+  preprint database set -d hal --profile <idhal>
+  OR
+  preprint database set -d hal --orcid <0000-0000-0000-0000>" -t error -l preprint
             return 1
         fi
 
@@ -212,6 +221,14 @@ __hal__() {
 
     __preprint_provider_hal_get() {
         local id="$1"
+        local draft_row
+        if draft_row="$(__preprint_draft_get "hal" "$id" 2>/dev/null)"; then
+            IFS=$'\t' read -r _ d_id d_date d_title d_authors d_pkg d_extra <<< "$draft_row"
+            printf "ID:        %s\nStatus:    DRAFT\nTitle:     %s\nDate:      %s\nAuthors:   %s\nPackage:   %s\nEdit-IRI:  %s\n" \
+                "$d_id" "$d_title" "$d_date" "$d_authors" "$d_pkg" "$d_extra"
+            return 0
+        fi
+
         local base_id="$id"
         if [[ "$base_id" =~ ^(.+)v[0-9]+$ ]]; then
             base_id="${BASH_REMATCH[1]}"
@@ -229,13 +246,20 @@ __hal__() {
         curl -sSL "https://api.archives-ouvertes.fr/search/?q=${enc_term}&fl=${hal_fl}&sort=producedDate_tdate+${hal_dir}&start=${start}&rows=${rows}&wt=xml" | __preprint_parse_hal_xml "compact" || echo "No entries found in HAL."
     }
 
+    # Stages a deposit in HAL as a DRAFT (In-Progress: true) and caches package for 'preprint publish'
     __preprint_provider_hal_send() {
         local file="$PREPRINT_SEND_FILE" meta="$PREPRINT_SEND_META" title="$PREPRINT_SEND_TITLE"
         local author="$PREPRINT_SEND_AUTHOR" abstract="$PREPRINT_SEND_ABSTRACT" category="${PREPRINT_SEND_CATEGORY:-info}"
-        local user pass token sword_url
+        local doi="$PREPRINT_SEND_DOI" pub_date="$PREPRINT_SEND_DATE"
+        local work_type="${PREPRINT_SEND_TYPE:-preprint}"
+
+        local user pass token sword_url idhal orcid
         user="${HAL_USER:-$(__preprint_get_conf hal user)}"
         pass="${HAL_PASS:-$(__preprint_get_conf hal pass)}"
         token="${HAL_TOKEN:-$(__preprint_get_conf hal token)}"
+        idhal="${HAL_PROFILE:-$(__preprint_get_conf hal profile)}"
+        orcid="${HAL_ORCID:-$(__preprint_get_conf hal orcid)}"
+        [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid orcid)"
         sword_url="$(__preprint_hal_sword_url)"
 
         local auth_args=()
@@ -248,43 +272,75 @@ __hal__() {
             return 1
         fi
 
-        local content_type="application/zip"
-        local packaging="http://purl.org/net/sword-types/AOfr"
-        local tmp_dir="" upload_file="$file"
+        local hal_typology="UNDEFINED"
+        case "${work_type,,}" in
+            article|journal-article) hal_typology="ART" ;;
+            conference|inproceedings) hal_typology="COMM" ;;
+            poster) hal_typology="POSTER" ;;
+            thesis|phdthesis) hal_typology="THESE" ;;
+            report) hal_typology="REPORT" ;;
+            *) hal_typology="UNDEFINED" ;;
+        esac
 
-        if [[ "$file" == *.xml ]]; then
-            content_type="text/xml"
-            packaging="http://purl.org/net/sword-types/AOfr-tei"
-        elif [[ "$file" != *.zip ]]; then
-            tmp_dir="$(mktemp -d)"
-            upload_file="$tmp_dir/hal_deposit.zip"
-            local pdf_name
-            pdf_name="$(basename "$file")"
-            cp "$file" "$tmp_dir/$pdf_name"
+        [[ -z "$pub_date" ]] && printf -v pub_date "%(%Y-%m-%d)T" -1
+        [[ -z "$title" && -n "$file" ]] && title="$(basename "${file%.*}")"
+        [[ -z "$title" ]] && { __log "HAL deposit requires a title (-t/--title)." -t error -l preprint; return 1; }
+        [[ -z "$author" ]] && author="${USER:-Anonymous}"
+        [[ -z "$abstract" ]] && abstract="Preprint uploaded via omni preprint tool."
 
-            if [[ -n "$meta" && -f "$meta" ]]; then
+        local esc_title esc_abs esc_dom esc_date authors_xml="" idno_xml="" edition_ref=""
+        esc_title=$(__preprint_xml_escape "$title")
+        esc_abs=$(__preprint_xml_escape "$abstract")
+        esc_dom=$(__preprint_xml_escape "$category")
+        esc_date=$(__preprint_xml_escape "$pub_date")
+
+        local IFS=';' a idx=0
+        for a in $author; do
+            a="${a#"${a%%[![:space:]]*}"}"
+            a="${a%"${a##*[![:space:]]}"}"
+            [[ -z "$a" ]] && continue
+            local first="" last="$a"
+            if [[ "$a" == *","* ]]; then
+                last="${a%%,*}"
+                first="${a#*,}"
+                first="${first#"${first%%[![:space:]]*}"}"
+            elif [[ "$a" == *" "* ]]; then
+                first="${a% *}"
+                last="${a##* }"
+            fi
+            local author_ids=""
+            if (( idx == 0 )); then
+                [[ -n "$idhal" ]] && author_ids+="<idno type=\"idhal\" notation=\"string\">$(__preprint_xml_escape "$idhal")</idno>"
+                [[ -n "$orcid" ]] && author_ids+="<idno type=\"ORCID\">https://orcid.org/$(__preprint_xml_escape "$orcid")</idno>"
+            fi
+            authors_xml+="              <author role=\"aut\"><persName><forename>$(__preprint_xml_escape "$first")</forename><surname>$(__preprint_xml_escape "$last")</surname></persName>${author_ids}</author>"$'\n'
+            ((idx++))
+        done
+
+        [[ -n "$doi" ]] && idno_xml+="              <idno type=\"doi\">$(__preprint_xml_escape "$doi")</idno>"$'\n'
+        [[ -n "${PREPRINT_SEND_EXT_IDS[arxiv]:-}" ]] && idno_xml+="              <idno type=\"arXiv\">$(__preprint_xml_escape "${PREPRINT_SEND_EXT_IDS[arxiv]}")</idno>"$'\n'
+
+        local content_type="text/xml"
+        local packaging="http://purl.org/net/sword-types/AOfr-tei"
+        local tmp_dir="$(mktemp -d)"
+        local upload_file="$tmp_dir/meta.xml"
+
+        if [[ -n "$file" && "$file" == *.zip ]]; then
+            content_type="application/zip"
+            packaging="http://purl.org/net/sword-types/AOfr"
+            upload_file="$file"
+        elif [[ -n "$file" && "$file" == *.xml ]]; then
+            upload_file="$file"
+        else
+            if [[ -n "$file" && -f "$file" ]]; then
+                local pdf_name="$(basename "$file")"
+                cp "$file" "$tmp_dir/$pdf_name"
+                edition_ref="<ref type=\"file\" target=\"$(__preprint_xml_escape "$pdf_name")\" subtype=\"author\" n=\"1\"/>"
+            fi
+
+            if __preprint_is_raw_payload_meta "$meta"; then
                 cp "$meta" "$tmp_dir/meta.xml"
             else
-                [[ -z "$title" ]] && title="$(basename "${file%.*}")"
-                [[ -z "$author" ]] && author="${USER:-Anonymous}"
-                [[ -z "$abstract" ]] && abstract="Preprint uploaded via omni preprint tool."
-                local esc_title esc_abs esc_dom esc_pdf authors_xml=""
-                esc_title=$(__preprint_xml_escape "$title")
-                esc_abs=$(__preprint_xml_escape "$abstract")
-                esc_dom=$(__preprint_xml_escape "$category")
-                esc_pdf=$(__preprint_xml_escape "$pdf_name")
-                local IFS=';' a
-                for a in $author; do
-                    a="${a#"${a%%[![:space:]]*}"}"
-                    a="${a%"${a##*[![:space:]]}"}"
-                    [[ -z "$a" ]] && continue
-                    local first="" last="$a"
-                    if [[ "$a" == *" "* ]]; then
-                        first="${a% *}"
-                        last="${a##* }"
-                    fi
-                    authors_xml+="              <author role=\"aut\"><persName><forename>$(__preprint_xml_escape "$first")</forename><surname>$(__preprint_xml_escape "$last")</surname></persName></author>"$'\n'
-                done
                 cat > "$tmp_dir/meta.xml" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <TEI xmlns="http://www.tei-c.org/ns/1.0" xmlns:hal="http://hal.archives-ouvertes.fr/">
@@ -294,7 +350,8 @@ __hal__() {
         <biblFull>
           <editionStmt>
             <edition>
-              <ref type="file" target="${esc_pdf}" subtype="author" n="1"/>
+              <date type="whenProduced">${esc_date}</date>
+              ${edition_ref}
             </edition>
           </editionStmt>
           <sourceDesc>
@@ -303,13 +360,19 @@ __hal__() {
                 <title xml:lang="en">${esc_title}</title>
 ${authors_xml%$'\n'}
               </analytic>
+              <monogr>
+                <imprint>
+                  <date type="datePub">${esc_date}</date>
+                </imprint>
+              </monogr>
+${idno_xml%$'\n'}
             </biblStruct>
           </sourceDesc>
           <profileDesc>
             <langUsage><language ident="en"/></langUsage>
             <textClass>
               <classCode scheme="halDomain" n="${esc_dom}"/>
-              <classCode scheme="halTypology" n="UNDEFINED"/>
+              <classCode scheme="halTypology" n="${hal_typology}"/>
             </textClass>
             <abstract xml:lang="en">${esc_abs}</abstract>
           </profileDesc>
@@ -320,27 +383,154 @@ ${authors_xml%$'\n'}
 </TEI>
 EOF
             fi
-            (cd "$tmp_dir" && zip -qr "$upload_file" "$pdf_name" "meta.xml")
+
+            if [[ -n "$file" && -f "$file" ]]; then
+                content_type="application/zip"
+                packaging="http://purl.org/net/sword-types/AOfr"
+                upload_file="$tmp_dir/hal_deposit.zip"
+                (cd "$tmp_dir" && zip -qr "$upload_file" "$(basename "$file")" "meta.xml")
+            fi
         fi
 
-        __log "Submitting '$upload_file' to HAL SWORD API ($sword_url)..." -t info -l preprint
+        __log "Staging draft '$upload_file' on HAL SWORD v2 API ($sword_url, In-Progress: true)..." -t info -l preprint
         local resp http_code
         resp=$(curl -sS -w "\n%{http_code}" "${auth_args[@]}" \
             -H "Content-Type: ${content_type}" \
             -H "Content-Disposition: attachment; filename=$(basename "$upload_file")" \
             -H "Packaging: ${packaging}" \
+            -H "In-Progress: true" \
             --data-binary @"$upload_file" \
             "$sword_url" 2>&1)
-        [[ -n "$tmp_dir" ]] && rm -rf "$tmp_dir"
 
         http_code="${resp##*$'\n'}"
         local body="${resp%$'\n'*}"
+
         if [[ "$http_code" =~ ^20[012]$ ]]; then
-            __log "HAL deposit succeeded (HTTP $http_code)." -t success -l preprint
+            local hal_id edit_iri
+            hal_id=$(LC_ALL=C awk 'match($0, /<id>[^<]+<\/id>/) { s = substr($0, RSTART + 4, RLENGTH - 9); print s; exit }' <<< "$body")
+            edit_iri=$(LC_ALL=C awk 'match($0, /rel="edit"[^>]*href="[^"]+"/) { s = substr($0, RSTART, RLENGTH); sub(/^.*href="/, "", s); sub(/"$/, "", s); print s; exit }' <<< "$body")
+            [[ -z "$hal_id" ]] && hal_id="hal-draft-$(date +%s)"
+            [[ -z "$edit_iri" ]] && edit_iri="${sword_url}/${hal_id}"
+
+            local cache_dir="${XDG_DATA_HOME:-$HOME/.local/share}/omni/preprint/hal_drafts"
+            mkdir -p "$cache_dir"
+            local cached_pkg="${cache_dir}/${hal_id}_$(basename "$upload_file")"
+            cp "$upload_file" "$cached_pkg"
+            [[ -n "$tmp_dir" ]] && rm -rf "$tmp_dir"
+
+            __preprint_draft_save "hal" "$hal_id" "$pub_date" "$title" "${author//;/, }" "$cached_pkg" "${content_type}|${packaging}|${edit_iri}"
+            __log "HAL draft staged (ID: $hal_id). Run 'preprint publish $hal_id -d hal' to finalize publication." -t success -l preprint
             echo "$body"
         else
-            __log "HAL deposit failed (HTTP $http_code)." -t error -l preprint
+            [[ -n "$tmp_dir" ]] && rm -rf "$tmp_dir"
+            __log "HAL draft deposit failed (HTTP $http_code)." -t error -l preprint
             echo "$body" >&2
+            return 1
+        fi
+    }
+
+    # Finalizes a staged [DRAFT] deposit on HAL (In-Progress: false)
+    __preprint_provider_hal_publish() {
+        local id="$1"
+        [[ -z "$id" ]] && { __log "HAL draft ID required: preprint publish <id> -d hal" -t error -l preprint; return 1; }
+
+        local user pass token sword_url auth_args=()
+        user="${HAL_USER:-$(__preprint_get_conf hal user)}"
+        pass="${HAL_PASS:-$(__preprint_get_conf hal pass)}"
+        token="${HAL_TOKEN:-$(__preprint_get_conf hal token)}"
+        sword_url="$(__preprint_hal_sword_url)"
+
+        if [[ -n "$token" ]]; then
+            auth_args=(-H "Authorization: Bearer $token")
+        elif [[ -n "$user" && -n "$pass" ]]; then
+            auth_args=(-u "${user}:${pass}")
+        else
+            __log "HAL credentials missing." -t error -l preprint
+            return 1
+        fi
+
+        local draft_row cached_pkg="" extra="" content_type="application/zip" packaging="http://purl.org/net/sword-types/AOfr" edit_iri="${sword_url}/${id}"
+        if draft_row="$(__preprint_draft_get "hal" "$id" 2>/dev/null)"; then
+            IFS=$'\t' read -r _ _ _ _ _ cached_pkg extra <<< "$draft_row"
+            if [[ "$extra" == *"|"* ]]; then
+                content_type="${extra%%|*}"
+                local rest="${extra#*|}"
+                packaging="${rest%%|*}"
+                edit_iri="${rest#*|}"
+            fi
+        fi
+
+        __log "Publishing HAL draft '$id' ($edit_iri, In-Progress: false)..." -t info -l preprint
+        local resp http_code
+        if [[ -n "$cached_pkg" && -f "$cached_pkg" ]]; then
+            resp=$(curl -sS -w "\n%{http_code}" -X PUT "${auth_args[@]}" \
+                -H "Content-Type: ${content_type}" \
+                -H "Content-Disposition: attachment; filename=$(basename "$cached_pkg")" \
+                -H "Packaging: ${packaging}" \
+                -H "In-Progress: false" \
+                -H "X-Allow-Completion: true" \
+                --data-binary @"$cached_pkg" \
+                "$edit_iri" 2>&1)
+            http_code="${resp##*$'\n'}"
+            if [[ ! "$http_code" =~ ^20[0124]$ ]]; then
+                resp=$(curl -sS -w "\n%{http_code}" -X POST "${auth_args[@]}" \
+                    -H "Content-Type: ${content_type}" \
+                    -H "Content-Disposition: attachment; filename=$(basename "$cached_pkg")" \
+                    -H "Packaging: ${packaging}" \
+                    -H "In-Progress: false" \
+                    -H "X-Allow-Completion: true" \
+                    --data-binary @"$cached_pkg" \
+                    "$sword_url" 2>&1)
+                http_code="${resp##*$'\n'}"
+            fi
+        else
+            resp=$(curl -sS -w "\n%{http_code}" -X POST "${auth_args[@]}" \
+                -H "In-Progress: false" \
+                -H "X-Allow-Completion: true" \
+                -H "Content-Length: 0" \
+                "$edit_iri" 2>&1)
+            http_code="${resp##*$'\n'}"
+        fi
+
+        local body="${resp%$'\n'*}"
+        if [[ "$http_code" =~ ^20[0124]$ ]]; then
+            local final_id
+            final_id=$(LC_ALL=C awk 'match($0, /<id>[^<]+<\/id>/) { s = substr($0, RSTART + 4, RLENGTH - 9); print s; exit }' <<< "$body")
+            __log "HAL draft '$id' published${final_id:+ (HAL ID: $final_id)}!" -t success -l preprint
+            return 0
+        else
+            __log "Failed to publish HAL draft '$id' (HTTP $http_code)." -t error -l preprint
+            echo "$body" >&2
+            return 1
+        fi
+    }
+
+    __preprint_provider_hal_rm() {
+        local id="$1"
+        [[ -z "$id" ]] && { __log "HAL ID required to remove deposit." -t error -l preprint; return 1; }
+        local user pass token sword_url auth_args=()
+        user="${HAL_USER:-$(__preprint_get_conf hal user)}"
+        pass="${HAL_PASS:-$(__preprint_get_conf hal pass)}"
+        token="${HAL_TOKEN:-$(__preprint_get_conf hal token)}"
+        sword_url="$(__preprint_hal_sword_url)"
+
+        if [[ -n "$token" ]]; then
+            auth_args=(-H "Authorization: Bearer $token")
+        elif [[ -n "$user" && -n "$pass" ]]; then
+            auth_args=(-u "${user}:${pass}")
+        else
+            __log "HAL credentials required to delete HAL entries." -t error -l preprint
+            return 1
+        fi
+
+        local resp http_code
+        resp=$(curl -sS -w "\n%{http_code}" -X DELETE "${auth_args[@]}" "${sword_url}/${id}" 2>&1)
+        http_code="${resp##*$'\n'}"
+        if [[ "$http_code" =~ ^20[024]$ ]] || __preprint_draft_get "hal" "$id" >/dev/null 2>&1; then
+            __log "Removed '$id' from HAL." -t success -l preprint
+        else
+            __log "Failed to remove '$id' from HAL (HTTP $http_code)." -t error -l preprint
+            echo "${resp%$'\n'*}" >&2
             return 1
         fi
     }
