@@ -50,6 +50,7 @@ __s2__() {
                         out = (out == "" ? unesc(m) : out ", " unesc(m))
                     }
                 }
+                if (out == "") out = get_str(chunk, "authorsYear")
                 return out
             }
             { raw = raw $0 "\n" }
@@ -88,13 +89,13 @@ __s2__() {
                     exit 0
                 }
 
-                n = split(raw, items, /"paperId"[ \t]*:[ \t]*"/)
+                n = split(raw, items, /"(paperId|id)"[ \t]*:[ \t]*"/)
                 if (n <= 1) exit 1
                 count = 0
                 for (i = 2; i <= n; i++) {
                     c = "\"paperId\":\"" items[i]
                     pid = get_str(c, "paperId")
-                    if (pid == "" || (pid in seen)) continue
+                    if (pid == "" || length(pid) < 10 || (pid in seen)) continue
                     title = get_str(c, "title")
                     if (title == "") continue
                     seen[pid] = 1
@@ -133,6 +134,10 @@ __s2__() {
 
     __preprint_provider_s2_get() {
         local id="$1"
+        if [[ "$id" == W* ]]; then
+            __preprint_provider_openalex_get "$id"
+            return $?
+        fi
         local -a hdrs=()
         mapfile -t hdrs < <(__preprint_s2_headers)
         local fields="paperId,title,abstract,year,publicationDate,venue,citationCount,authors,url,openAccessPdf,externalIds"
@@ -140,13 +145,27 @@ __s2__() {
     }
 
     __preprint_provider_s2_search() {
-        local term="$1" limit="${2:-50}" offset="${3:-0}" sort_by="${4:-time}" reverse="${5:-0}"
+        local term="$1" limit="${2:-25}" offset="${3:-0}" sort_by="${4:-time}" reverse="${5:-0}"
         (( limit > 100 )) && limit=100
         local enc_term=$(__preprint_urlencode "$term")
         local -a hdrs=()
         mapfile -t hdrs < <(__preprint_s2_headers)
         local fields="paperId,title,year,publicationDate,authors"
-        curl -fsSL "${hdrs[@]}" "https://api.semanticscholar.org/graph/v1/paper/search?query=${enc_term}&offset=${offset}&limit=${limit}&fields=${fields}" 2>/dev/null | __preprint_parse_s2_json "compact" || echo "No entries found in Semantic Scholar."
+        local resp out=""
+        resp=$(curl -fsSL "${hdrs[@]}" "https://api.semanticscholar.org/graph/v1/paper/search?query=${enc_term}&offset=${offset}&limit=${limit}&fields=${fields}" 2>/dev/null)
+        [[ -n "$resp" ]] && out=$(__preprint_parse_s2_json "compact" <<< "$resp" 2>/dev/null)
+
+        # Fallback to S2 bulk search endpoint (higher public rate limit)
+        if [[ -z "$out" ]]; then
+            resp=$(curl -fsSL "${hdrs[@]}" "https://api.semanticscholar.org/graph/v1/paper/search/bulk?query=${enc_term}&fields=${fields}" 2>/dev/null)
+            [[ -n "$resp" ]] && out=$(__preprint_parse_s2_json "compact" <<< "$resp" 2>/dev/null | head -n "$limit")
+        fi
+
+        if [[ -n "$out" ]]; then
+            echo "$out"
+        else
+            echo "No entries found in Semantic Scholar."
+        fi
     }
 
     __preprint_provider_s2_download() {

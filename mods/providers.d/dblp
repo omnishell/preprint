@@ -9,14 +9,18 @@ __dblp__() {
     __preprint_parse_dblp_xml() {
         local mode="${1:-compact}"
         LC_ALL=C awk -v mode="$mode" '
-            function strip_tag(s) {
-                gsub(/<[^>]+>/, "", s)
-                gsub(/&amp;/, "\\&", s); gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s)
+            function unesc_xml(s) {
+                gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); gsub(/&amp;/, "\\&", s)
+                gsub(/&quot;/, "\"", s); gsub(/&apos;/, "\x27", s)
                 gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s)
+                gsub(/[ \t\r\n]+/, " ", s)
                 return s
             }
-            BEGIN { in_rec = 0; count = 0 }
-            /<(info|article|inproceedings|proceedings|book|incollection|phdthesis|mastersthesis|informal)([ \t>]|$)/ {
+            BEGIN {
+                RS = ">"
+                in_rec = 0; count = 0; cur_tag = ""
+            }
+            /<(info|article|inproceedings|proceedings|book|incollection|phdthesis|mastersthesis|informal)([ \t]|$)/ {
                 if (!in_rec) {
                     in_rec = 1
                     key = ""; title = ""; authors = ""; year = "N/A"; venue = "N/A"; doi = "N/A"; ee = ""; url = ""
@@ -24,8 +28,9 @@ __dblp__() {
                         key = substr($0, RSTART + 5, RLENGTH - 6)
                     }
                 }
+                next
             }
-            /<\/(info|article|inproceedings|proceedings|book|incollection|phdthesis|mastersthesis|informal)>/ {
+            /<\/(info|article|inproceedings|proceedings|book|incollection|phdthesis|mastersthesis|informal)$/ {
                 if (in_rec && title != "") {
                     in_rec = 0
                     count++
@@ -41,16 +46,27 @@ __dblp__() {
                         printf "[%s] (%s) %s   %s\n", key, year, title, authors
                     }
                 }
+                next
             }
             in_rec {
-                if ($0 ~ /<key>/)     key = strip_tag($0)
-                if ($0 ~ /<title>/)   title = strip_tag($0)
-                if ($0 ~ /<author/)   { a = strip_tag($0); authors = (authors == "" ? a : authors ", " a) }
-                if ($0 ~ /<year>/)    year = strip_tag($0)
-                if ($0 ~ /<(venue|journal|booktitle)>/) venue = strip_tag($0)
-                if ($0 ~ /<doi>/)     doi = strip_tag($0)
-                if ($0 ~ /<ee[^>]*>/) { if (ee == "") ee = strip_tag($0) }
-                if ($0 ~ /<url>/)     url = strip_tag($0)
+                if ($0 ~ /<\/(key|title|author|year|venue|journal|booktitle|doi|ee|url)$/) {
+                    tag = $0
+                    sub(/^.*</, "", tag)
+                    sub(/^\//, "", tag)
+                    val = $0
+                    sub(/<\/[^<]+$/, "", val)
+                    val = unesc_xml(val)
+                    if (val != "") {
+                        if (tag == "key") key = val
+                        else if (tag == "title") { sub(/\.$/, "", val); title = val }
+                        else if (tag == "author") authors = (authors == "" ? val : authors ", " val)
+                        else if (tag == "year") year = val
+                        else if (tag == "venue" || tag == "journal" || tag == "booktitle") { if (venue == "N/A") venue = val }
+                        else if (tag == "doi") doi = val
+                        else if (tag == "ee") { if (ee == "") ee = val }
+                        else if (tag == "url") url = val
+                    }
+                }
             }
             END {
                 if (count == 0) exit 1

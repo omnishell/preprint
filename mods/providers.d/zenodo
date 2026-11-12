@@ -172,15 +172,24 @@ __zenodo__() {
     }
 
     __preprint_provider_zenodo_search() {
-        local term="$1" page_size="${2:-50}" page="${3:-1}" sort_by="${4:-time}" reverse="${5:-0}"
-        local base_url enc_term zenodo_sort="mostrecent"
+        local term="$1" page_size="${2:-25}" page="${3:-1}" sort_by="${4:-time}" reverse="${5:-0}"
+        local base_url token enc_term zenodo_sort="mostrecent"
         base_url="$(__preprint_zenodo_base_url)"
+        token="${ZENODO_TOKEN:-$(__preprint_get_conf zenodo token)}"
         enc_term=$(__preprint_urlencode "$term")
+
+        # Zenodo anonymous API strictly rejects size > 25 with HTTP 400
+        if [[ -z "$token" ]] && (( page_size > 25 )); then
+            page_size=25
+        fi
+        local auth_header=()
+        [[ -n "$token" ]] && auth_header=(-H "Authorization: Bearer $token")
+
         if [[ "$sort_by" == "time" && $reverse -eq 1 ]]; then
             zenodo_sort="-mostrecent"
         fi
-        curl -sSL "${base_url}/records?q=${enc_term}&sort=${zenodo_sort}&size=${page_size}&page=${page}" | __preprint_parse_zenodo_json "search" || echo "No records found."
-    }
+        curl -sSL "${auth_header[@]}" "${base_url}/records?q=${enc_term}&sort=${zenodo_sort}&size=${page_size}&page=${page}" | __preprint_parse_zenodo_json "search" || echo "No records found."
+    }   
 
     # Stages a new draft deposition on Zenodo
     __preprint_provider_zenodo_send() {

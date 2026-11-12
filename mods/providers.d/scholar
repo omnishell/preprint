@@ -228,18 +228,54 @@ __scholar__() {
     __preprint_provider_scholar_search() {
         local term="$1" limit="${2:-20}" start="${3:-0}" sort_by="${4:-time}" reverse="${5:-0}"
         local enc_term=$(__preprint_urlencode "$term")
+        local token="${SCHOLAR_TOKEN:-$(__preprint_get_conf scholar token)}"
         local html out=""
-        html=$(curl -fsSL -A "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0" \
-            "https://scholar.google.com/scholar?q=${enc_term}&hl=en&start=${start}&num=${limit}" 2>/dev/null)
-        [[ -n "$html" ]] && out=$(__preprint_parse_scholar_html <<< "$html" 2>/dev/null)
+
+        if [[ -n "$token" ]]; then
+            local serp_json
+            serp_json=$(curl -fsSL "https://serpapi.com/search.json?engine=google_scholar&q=${enc_term}&start=${start}&num=${limit}&api_key=$(__preprint_urlencode "$token")" 2>/dev/null)
+            out=$(LC_ALL=C awk '
+                function get_str(c, k,    p, s) {
+                    p = "\"" k "\"[ \t]*:[ \t]*\""
+                    if (match(c, p "(\\\\.|[^\"\\\\])*\"")) {
+                        s = substr(c, RSTART, RLENGTH); sub("^" p, "", s); sub(/"$/, "", s); return s
+                    }
+                    return ""
+                }
+                { raw = raw $0 "\n" }
+                END {
+                    n = split(raw, arr, /"result_id"[ \t]*:/)
+                    for (i = 2; i <= n; i++) {
+                        c = "\"result_id\":" arr[i]
+                        rid = get_str(c, "result_id")
+                        t = get_str(c, "title")
+                        s = get_str(c, "summary")
+                        yr = "N/A"
+                        if (match(s, /(19|20)[0-9]{2}/)) yr = substr(s, RSTART, 4)
+                        if (t != "") printf "[%s] (%s) %s   %s\n", rid, yr, t, (s ? s : "Google Scholar")
+                    }
+                }
+            ' <<< "$serp_json")
+        fi
 
         if [[ -z "$out" ]]; then
-            # Fallback to Semantic Scholar if Google Scholar blocks automated requests with a CAPTCHA
-            __preprint_provider_s2_search "$term" "$limit" "$start" "$sort_by" "$reverse"
-            return $?
+            html=$(curl -fsSL -A "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0" \
+                "https://scholar.google.com/scholar?q=${enc_term}&hl=en&start=${start}&num=${limit}" 2>/dev/null)
+            [[ -n "$html" ]] && out=$(__preprint_parse_scholar_html <<< "$html" 2>/dev/null)
         fi
-        echo "$out"
-    }
+
+        if [[ -z "$out" ]]; then
+            # Fallback to OpenAlex when Google Scholar blocks headless curl requests
+            local page=$(( (start / (limit > 0 ? limit : 20)) + 1 ))
+            out=$(__preprint_provider_openalex_search "$term" "$limit" "$page" "$sort_by" "$reverse")
+        fi
+
+        if [[ -n "$out" && "$out" != "No "* ]]; then
+            echo "$out"
+        else
+            echo "No entries found in Google Scholar."
+        fi
+    }   
 
     __preprint_provider_scholar_download() {
         local id="$1" out_path="${2:-}"
