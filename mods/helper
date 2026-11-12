@@ -463,7 +463,7 @@ __helper__() {
     # =========================================================================
     __preprint_save_pdf_stream() {
         local pdf_url="$1" default_name="$2" out_path="${3:-}" fallback_url="${4:-}"
-        [[ -z "$pdf_url" ]] && return 1
+        [[ -z "$pdf_url" || "$pdf_url" == "-" || "$pdf_url" == "N/A" ]] && return 1
 
         local dest="$default_name"
         if [[ -n "$out_path" ]]; then
@@ -474,40 +474,56 @@ __helper__() {
             fi
         fi
 
+        # Normalize arXiv /abs/ links to /pdf/
+        if [[ "$pdf_url" =~ ^https?://arxiv\.org/abs/(.+)$ ]]; then
+            pdf_url="https://arxiv.org/pdf/${BASH_REMATCH[1]}.pdf"
+        fi
+
         __log "Downloading PDF from $pdf_url -> $dest ..." -t info -l preprint
-        if curl -fL -A "Mozilla/5.0 (OmniPreprint/2.0)" --progress-bar "$pdf_url" -o "$dest"; then
+        local ua="Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+        if curl -fL -A "$ua" -H "Accept: application/pdf,*/*" --progress-bar "$pdf_url" -o "$dest" && [[ -s "$dest" ]] && head -c 1024 "$dest" | grep -q "%PDF-"; then
             __log "Saved PDF to '$dest'." -t success -l preprint
             return 0
-        elif [[ -n "$fallback_url" ]] && curl -fL -A "Mozilla/5.0 (OmniPreprint/2.0)" --progress-bar "$fallback_url" -o "$dest"; then
+        elif [[ -n "$fallback_url" && "$fallback_url" != "-" ]] && curl -fL -A "$ua" -H "Accept: application/pdf,*/*" --progress-bar "$fallback_url" -o "$dest" && [[ -s "$dest" ]] && head -c 1024 "$dest" | grep -q "%PDF-"; then
             __log "Saved PDF to '$dest'." -t success -l preprint
             return 0
         else
             rm -f "$dest" 2>/dev/null
-            __log "Failed to download PDF from '$pdf_url'." -t error -l preprint
+            __log "Failed to download a valid PDF from '$pdf_url'." -t error -l preprint
             return 1
         fi
     }
 
     __preprint_resolve_doi_pdf() {
         local doi="${1#https://doi.org/}" out_path="${2:-}" default_name="${3:-paper.pdf}"
-        [[ -z "$doi" ]] && return 1
+        [[ -z "$doi" || "$doi" == "-" || "$doi" == "N/A" ]] && return 1
         if [[ "$doi" =~ 10\.48550/arXiv\.(.+)$ ]]; then
             __preprint_download_entry "arxiv" "${BASH_REMATCH[1]}" "$out_path"
             return $?
         fi
-        local oa_json pdf_url
+        local oa_json pdf_url oa_url
         oa_json=$(curl -fsSL "https://api.openalex.org/works/https://doi.org/$(__preprint_urlencode "$doi")" 2>/dev/null)
-        pdf_url=$(LC_ALL=C awk '
-            match($0, /"pdf_url"[ \t]*:[ \t]*"https?:\/\/[^"]+"/) {
-                s = substr($0, RSTART, RLENGTH)
-                sub(/^"pdf_url"[ \t]*:[ \t]*"/, "", s)
-                sub(/"$/, "", s)
-                print s; exit
+        IFS=$'\t' read -r pdf_url oa_url < <(LC_ALL=C awk '
+            { raw = raw $0 "\n" }
+            END {
+                p = "-"; o = "-"
+                if (match(raw, /"pdf_url"[ \t]*:[ \t]*"https?:\/\/[^"]+"/)) {
+                    s = substr(raw, RSTART, RLENGTH)
+                    sub(/^"pdf_url"[ \t]*:[ \t]*"/, "", s); sub(/"$/, "", s); p = s
+                }
+                if (match(raw, /"oa_url"[ \t]*:[ \t]*"https?:\/\/[^"]+"/)) {
+                    s = substr(raw, RSTART, RLENGTH)
+                    sub(/^"oa_url"[ \t]*:[ \t]*"/, "", s); sub(/"$/, "", s); o = s
+                }
+                printf "%s\t%s\n", p, o
             }
         ' <<< "$oa_json")
-        if [[ -n "$pdf_url" ]]; then
-            __preprint_save_pdf_stream "$pdf_url" "$default_name" "$out_path"
-            return $?
+
+        if [[ -n "$pdf_url" && "$pdf_url" != "-" ]]; then
+            __preprint_save_pdf_stream "$pdf_url" "$default_name" "$out_path" "${oa_url}" && return 0
+        fi
+        if [[ -n "$oa_url" && "$oa_url" != "-" ]]; then
+            __preprint_save_pdf_stream "$oa_url" "$default_name" "$out_path" && return 0
         fi
         return 1
     }
