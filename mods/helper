@@ -950,9 +950,12 @@ EOF
             used_fzf=1
         fi
 
-        __preprint_call "$db" get "$target"
-        if (( download == 1 || used_fzf == 1 )); then
-            __preprint_prompt_download "$db" "$target" "$download" "$out_path"
+        if __preprint_call "$db" get "$target"; then
+            if (( download == 1 || used_fzf == 1 )); then
+                __preprint_prompt_download "$db" "$target" "$download" "$out_path"
+            fi
+        else
+            return 1
         fi
     }
 
@@ -1088,8 +1091,11 @@ EOF
             return $?
         fi
 
-        __preprint_call "$db" get "$target"
-        __preprint_prompt_download "$db" "$target" "$download" "$out_path"
+        if __preprint_call "$db" get "$target"; then
+            __preprint_prompt_download "$db" "$target" "$download" "$out_path"
+        else
+            return 1
+        fi
     }
 
     # 'preprint send' stages the submission as a DRAFT on the platform

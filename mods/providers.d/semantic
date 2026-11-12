@@ -2,7 +2,7 @@
 
 __semantic__() {
     __preprint_register_provider "semantic" \
-        --aliases "semanticscholar,semantic-scholar,semantic" \
+        --aliases "s2,semanticscholar,semantic-scholar,semantic" \
         --pagination "offset" \
         --requires-file "false" \
         --desc "Semantic Scholar Academic Graph API (search, author profile works, OA PDFs)"
@@ -58,6 +58,7 @@ __semantic__() {
             END {
                 if (mode == "detailed") {
                     pid = get_str(raw, "paperId")
+                    if (pid == "") pid = get_str(raw, "id")
                     if (pid == "") exit 1
                     title = get_str(raw, "title"); if (title == "") title = "Untitled"
                     pub = get_str(raw, "publicationDate")
@@ -90,8 +91,6 @@ __semantic__() {
                     exit 0
                 }
 
-                # Split around each "title": occurrence while keeping 400 chars before and 2500 after
-                # so field order ("paperId" before OR after "title") never matters.
                 n = split(raw, parts, /"title"[ \t]*:[ \t]*"/)
                 if (n <= 1) exit 1
                 count = 0
@@ -125,12 +124,31 @@ __semantic__() {
         '
     }
 
+    # Fetch paper JSON via GET /paper/<id> or fallback to POST /paper/batch (which avoids GET rate limits)
+    __preprint_semantic_fetch_paper_json() {
+        local id="$1" fields="$2"
+        local token="${SEMANTIC_TOKEN:-${S2_TOKEN:-$(__preprint_get_conf semantic token)}}"
+        local -a auth_hdr=()
+        [[ -n "$token" ]] && auth_hdr=(-H "x-api-key: $token")
+
+        local resp=""
+        resp=$(curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/paper/$(__preprint_urlencode "$id")?fields=${fields}" 2>/dev/null)
+        if [[ -z "$resp" || "$resp" != *"\"paperId\""* ]]; then
+            # Fallback to POST /paper/batch endpoint (separate rate-limit bucket on S2)
+            resp=$(curl -fsSL -X POST "${auth_hdr[@]}" \
+                -H "Content-Type: application/json" \
+                -d "{\"ids\":[\"$(__preprint_json_escape "$id")\"]}" \
+                "https://api.semanticscholar.org/graph/v1/paper/batch?fields=${fields}" 2>/dev/null)
+        fi
+        printf '%s' "$resp"
+    }
+
     __preprint_provider_semantic_list() {
         local max="${1:-0}" sort_by="${2:-time}" reverse="${3:-0}"
         local limit=$(( max > 0 && max <= 1000 ? max : 200 ))
-        local profile="${SEMANTIC_PROFILE:-$(__preprint_get_conf semantic profile)}"
+        local profile="${SEMANTIC_PROFILE:-${S2_PROFILE:-$(__preprint_get_conf semantic profile)}}"
         [[ -z "$profile" ]] && profile="$(__preprint_get_conf semantic author)"
-        local token="${SEMANTIC_TOKEN:-$(__preprint_get_conf semantic token)}"
+        local token="${SEMANTIC_TOKEN:-${S2_TOKEN:-$(__preprint_get_conf semantic token)}}"
 
         if [[ -z "$profile" ]]; then
             __log "Set your Semantic Scholar Author ID first:
@@ -150,18 +168,75 @@ __semantic__() {
             __preprint_provider_openalex_get "$id"
             return $?
         fi
-        local token="${SEMANTIC_TOKEN:-$(__preprint_get_conf semantic token)}"
-        local -a auth_hdr=()
-        [[ -n "$token" ]] && auth_hdr=(-H "x-api-key: $token")
+
         local fields="paperId,title,abstract,year,publicationDate,venue,citationCount,authors,url,openAccessPdf,externalIds"
-        curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/paper/$(__preprint_urlencode "$id")?fields=${fields}" 2>/dev/null | __preprint_parse_semantic_json "detailed" || echo "No entry found in Semantic Scholar for '$id'."
+        local json out=""
+        json="$(__preprint_semantic_fetch_paper_json "$id" "$fields")"
+        if [[ -n "$json" ]]; then
+            out="$(__preprint_parse_semantic_json "detailed" <<< "$json" 2>/dev/null)"
+        fi
+
+        # Fallback: scrape citation_* meta tags from https://www.semanticscholar.org/paper/<id> if API is 429 rate-limited
+        if [[ -z "$out" ]]; then
+            local html
+            html=$(curl -fsSL -A "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0" \
+                "https://www.semanticscholar.org/paper/$(__preprint_urlencode "$id")" 2>/dev/null)
+            if [[ -n "$html" ]]; then
+                out=$(LC_ALL=C awk -v pid="$id" '
+                    function unesc(s) {
+                        gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); gsub(/&amp;/, "\\&", s)
+                        gsub(/&quot;/, "\"", s); gsub(/&#39;|&apos;/, "\x27", s)
+                        gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s)
+                        return s
+                    }
+                    { raw = raw $0 "\n" }
+                    END {
+                        title = ""
+                        if (match(raw, /name="citation_title"[ \t]+content="[^"]+"/)) {
+                            s = substr(raw, RSTART, RLENGTH); sub(/^.*content="/, "", s); sub(/"$/, "", s); title = unesc(s)
+                        }
+                        if (title == "") exit 1
+                        authors = ""; s = raw
+                        while (match(s, /name="citation_author"[ \t]+content="[^"]+"/)) {
+                            m = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+                            sub(/^.*content="/, "", m); sub(/"$/, "", m)
+                            authors = (authors == "" ? unesc(m) : authors ", " unesc(m))
+                        }
+                        pub = "N/A"
+                        if (match(raw, /name="citation_publication_date"[ \t]+content="[^"]+"/)) {
+                            s = substr(raw, RSTART, RLENGTH); sub(/^.*content="/, "", s); sub(/"$/, "", s); pub = unesc(s)
+                        }
+                        doi = "N/A"
+                        if (match(raw, /name="citation_doi"[ \t]+content="[^"]+"/)) {
+                            s = substr(raw, RSTART, RLENGTH); sub(/^.*content="/, "", s); sub(/"$/, "", s); doi = unesc(s)
+                        }
+                        pdf = "N/A"
+                        if (match(raw, /name="citation_pdf_url"[ \t]+content="[^"]+"/)) {
+                            s = substr(raw, RSTART, RLENGTH); sub(/^.*content="/, "", s); sub(/"$/, "", s); pdf = unesc(s)
+                        }
+                        abs = "N/A"
+                        if (match(raw, /name="description"[ \t]+content="[^"]+"/)) {
+                            s = substr(raw, RSTART, RLENGTH); sub(/^.*content="/, "", s); sub(/"$/, "", s); abs = unesc(s)
+                        }
+                        printf "PaperId:   %s\nTitle:     %s\nPublished: %s\nAuthors:   %s\nDOI:       %s\nURL:       https://www.semanticscholar.org/paper/%s\nPDF:       %s\nAbstract:\n  %s\n", pid, title, pub, (authors ? authors : "Unknown Author"), doi, pid, pdf, abs
+                    }
+                ' <<< "$html")
+            fi
+        fi
+
+        if [[ -n "$out" ]]; then
+            echo "$out"
+            return 0
+        fi
+        __log "No entry found in Semantic Scholar for '$id'." -t error -l preprint
+        return 1
     }
 
     __preprint_provider_semantic_search() {
         local term="$1" limit="${2:-25}" offset="${3:-0}" sort_by="${4:-time}" reverse="${5:-0}"
         (( limit > 100 )) && limit=100
         local enc_term=$(__preprint_urlencode "$term")
-        local token="${SEMANTIC_TOKEN:-$(__preprint_get_conf semantic token)}"
+        local token="${SEMANTIC_TOKEN:-${S2_TOKEN:-$(__preprint_get_conf semantic token)}}"
         local -a auth_hdr=()
         [[ -n "$token" ]] && auth_hdr=(-H "x-api-key: $token")
 
@@ -172,19 +247,19 @@ __semantic__() {
         resp=$(curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/paper/search?query=${enc_term}&offset=${offset}&limit=${limit}&fields=${fields}" 2>/dev/null)
         [[ -n "$resp" ]] && out=$(__preprint_parse_semantic_json "compact" <<< "$resp" 2>/dev/null)
 
-        # 2. Bulk Search API fallback (separate rate-limit bucket on SEMANTIC)
+        # 2. Bulk Search API fallback (separate rate-limit bucket on S2)
         if [[ -z "$out" ]]; then
             resp=$(curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/paper/search/bulk?query=${enc_term}&fields=${fields}" 2>/dev/null)
             [[ -n "$resp" ]] && out=$(__preprint_parse_semantic_json "compact" <<< "$resp" 2>/dev/null | head -n "$limit")
         fi
 
-        # 3. Autocomplete endpoint fallback (rarely rate-limited)
+        # 3. Autocomplete endpoint fallback
         if [[ -z "$out" ]]; then
             resp=$(curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/paper/autocomplete?query=${enc_term}" 2>/dev/null)
             [[ -n "$resp" ]] && out=$(__preprint_parse_semantic_json "compact" <<< "$resp" 2>/dev/null)
         fi
 
-        # 4. OpenAlex fallback if SEMANTIC public anonymous pool returns HTTP 429 Too Many Requests
+        # 4. OpenAlex fallback if S2 public anonymous pool returns HTTP 429 Too Many Requests
         if [[ -z "$out" ]]; then
             local page=$(( (offset / (limit > 0 ? limit : 25)) + 1 ))
             out=$(__preprint_provider_openalex_search "$term" "$limit" "$page" "$sort_by" "$reverse" 2>/dev/null)
@@ -203,12 +278,32 @@ __semantic__() {
             __preprint_provider_openalex_download "$id" "$out_path"
             return $?
         fi
-        local token="${SEMANTIC_TOKEN:-$(__preprint_get_conf semantic token)}"
-        local -a auth_hdr=()
-        [[ -n "$token" ]] && auth_hdr=(-H "x-api-key: $token")
+
         local json pdf_url arx_id doi_id
-        json=$(curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/paper/$(__preprint_urlencode "$id")?fields=openAccessPdf,externalIds" 2>/dev/null)
-        read -r pdf_url arx_id doi_id < <(__preprint_parse_semantic_json "pdf" <<< "$json")
+        json="$(__preprint_semantic_fetch_paper_json "$id" "openAccessPdf,externalIds")"
+        if [[ -n "$json" ]]; then
+            read -r pdf_url arx_id doi_id < <(__preprint_parse_semantic_json "pdf" <<< "$json")
+        fi
+
+        # Fallback: check citation_pdf_url or citation_doi on the paper's web page
+        if [[ ( -z "$pdf_url" || "$pdf_url" == "-" ) && ( -z "$arx_id" || "$arx_id" == "-" ) && ( -z "$doi_id" || "$doi_id" == "-" ) ]]; then
+            local html
+            html=$(curl -fsSL -A "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0" \
+                "https://www.semanticscholar.org/paper/$(__preprint_urlencode "$id")" 2>/dev/null)
+            read -r pdf_url doi_id < <(LC_ALL=C awk '
+                { raw = raw $0 "\n" }
+                END {
+                    p = "-"; d = "-"
+                    if (match(raw, /name="citation_pdf_url"[ \t]+content="[^"]+"/)) {
+                        s = substr(raw, RSTART, RLENGTH); sub(/^.*content="/, "", s); sub(/"$/, "", s); p = s
+                    }
+                    if (match(raw, /name="citation_doi"[ \t]+content="[^"]+"/)) {
+                        s = substr(raw, RSTART, RLENGTH); sub(/^.*content="/, "", s); sub(/"$/, "", s); d = s
+                    }
+                    printf "%s\t%s\n", p, d
+                }
+            ' <<< "$html")
+        fi
 
         if [[ -n "$pdf_url" && "$pdf_url" != "-" ]]; then
             __preprint_save_pdf_stream "$pdf_url" "semantic_${id//\//_}.pdf" "$out_path"
