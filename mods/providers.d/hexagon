@@ -5,7 +5,7 @@ __hexagon__() {
         --aliases "hexagonmath,hexagon-math,hexagon math" \
         --pagination "offset" \
         --requires-file "true" \
-        --desc "Hexagon Math preprint server (stage drafts via send, publish via publish)"
+        --desc "Hexagon Math preprint server (OpenAPI v1.13: TeX/ZIP draft staging, preview & commit)"
 
     __preprint_hexagon_base_url() {
         local sb
@@ -15,6 +15,44 @@ __hexagon__() {
         else
             echo "${HEXAGON_API_URL:-https://hexagonmath.org}"
         fi
+    }
+
+    # Map arbitrary or shorthand categories to Hexagon's allowed math-and-adjacent-v2 subject enum
+    __preprint_hexagon_norm_subject() {
+        local c="${1:-math-ph}"
+        case "$c" in
+            math.AC|math.AG|math.AP|math.AT|math.CA|math.CO|math.CT|math.CV|math.DG|math.DS|math.FA|math.GM|math.GN|math.GR|math.GT|math.HO|math.IT|math.KT|math.LO|math.MG|math.MP|math.NA|math.NT|math.OA|math.OC|math.PR|math.QA|math.RA|math.RT|math.SG|math.SP|math.ST|cs.AI|cs.CC|cs.CG|cs.DM|cs.DS|cs.FL|cs.IT|cs.LO|cs.MS|cs.NA|cs.SC|math-ph|quant-ph|stat.TH)
+                echo "$c"
+                ;;
+            hep-th|hep-ph|gr-qc|nlin*)
+                echo "math-ph"
+                ;;
+            math*)
+                echo "math.GM"
+                ;;
+            cs*)
+                echo "cs.LO"
+                ;;
+            *)
+                echo "math.GM"
+                ;;
+        esac
+    }
+
+    # Default 5-char MSC2020 code matching subject when not explicitly provided
+    __preprint_hexagon_default_msc() {
+        local subj="$1"
+        case "$subj" in
+            math-ph|math.MP) echo "81T13" ;;
+            quant-ph)        echo "81P15" ;;
+            math.DG)         echo "53C07" ;;
+            math.NT)         echo "11F03" ;;
+            math.AG)         echo "14A10" ;;
+            math.SP)         echo "58J50" ;;
+            math.LO|cs.LO)   echo "03B10" ;;
+            cs.AI)           echo "68T01" ;;
+            *)               echo "00A05" ;;
+        esac
     }
 
     __preprint_parse_hexagon() {
@@ -35,10 +73,19 @@ __hexagon__() {
                 }
                 return ""
             }
+            function get_json_num(chunk, key,    pat, s) {
+                pat = "\"" key "\"[ \t]*:[ \t]*[0-9]+"
+                if (match(chunk, pat)) {
+                    s = substr(chunk, RSTART, RLENGTH)
+                    sub("^.*:[ \t]*", "", s)
+                    return s
+                }
+                return ""
+            }
             function is_json_draft(chunk,    st) {
                 st = tolower(get_json_str(chunk, "status"))
                 if (st == "") st = tolower(get_json_str(chunk, "state"))
-                if (st == "draft" || st == "unpublished" || st == "staged" || st == "in_progress" || st == "pending") return 1
+                if (st == "draft" || st == "uploading" || st == "unpublished" || st == "staged" || st == "in_progress" || st == "pending") return 1
                 if (chunk ~ /"(published|is_published)"[ \t]*:[ \t]*false/) return 1
                 return 0
             }
@@ -49,7 +96,7 @@ __hexagon__() {
                 return "N/A"
             }
             function get_json_date(chunk, id,    d, keys, n, i) {
-                n = split("submitted_at,submission_date,published_at,publication_date,released_at,created_at,updated_at,date", keys, ",")
+                n = split("submitted_at,submission_date,published_at,publication_date,released_at,created_at,updated_at,publishedAt,submittedAt,createdAt,date", keys, ",")
                 for (i = 1; i <= n; i++) {
                     d = get_json_str(chunk, keys[i])
                     if (d != "") return norm_date(d, id)
@@ -88,22 +135,34 @@ __hexagon__() {
                         if (m ~ ("^" base "v[0-9]+$") && best !~ /v[0-9]+$/) best = m
                     }
                 }
+                if (best == "") best = get_json_str(chunk, "identifier")
+                if (best == "") best = get_json_str(chunk, "draftId")
                 if (best == "") best = get_json_str(chunk, "id")
-                if (best == "") best = get_json_str(chunk, "work_id")
                 sub(/^hexagon:/, "", best)
                 return best
             }
             { raw = raw $0 "\n" }
             END {
-                if (mode == "extract_id") {
-                    id = pick_best_id(raw)
+                if (mode == "extract_draft_id") {
+                    id = get_json_str(raw, "draftId")
+                    if (id == "") id = get_json_str(raw, "id")
+                    if (id == "") id = pick_best_id(raw)
                     if (id != "") print id
                     exit 0
                 }
-                if (mode == "check_status") {
-                    if (is_json_draft(raw)) print "draft"
-                    else if (raw ~ /"(status|state)"[ \t]*:[ \t]*"published"/ || raw ~ /"(published|is_published)"[ \t]*:[ \t]*true/) print "published"
-                    else print "unknown"
+                if (mode == "extract_upload_id") {
+                    id = get_json_str(raw, "uploadId")
+                    if (id == "") id = get_json_str(raw, "id")
+                    if (id == "") id = get_json_str(raw, "existingUploadId")
+                    if (id != "") print id
+                    exit 0
+                }
+                if (mode == "extract_entry_tex") {
+                    # Find first .tex candidate from /expand response
+                    if (match(raw, /"[^"]+\.tex"/)) {
+                        s = substr(raw, RSTART + 1, RLENGTH - 2)
+                        print unesc_json(s)
+                    }
                     exit 0
                 }
                 if (raw ~ /^[ \t\r\n]*[\{\[]/) {
@@ -113,10 +172,13 @@ __hexagon__() {
                         title = get_json_str(raw, "title"); if (title == "") title = "Untitled"
                         pub = get_json_date(raw, id)
                         authors = get_json_authors(raw); if (authors == "") authors = "Unknown Contributor"
-                        cat = get_json_str(raw, "primary_category"); if (cat == "") cat = get_json_str(raw, "category"); if (cat == "") cat = "N/A"
+                        cat = get_json_str(raw, "subject")
+                        if (cat == "") cat = get_json_str(raw, "primary_category")
+                        if (cat == "") cat = "N/A"
+                        pages = get_json_num(raw, "pageCount"); if (pages == "") pages = "N/A"
                         abs = get_json_str(raw, "abstract"); if (abs == "") abs = get_json_str(raw, "summary")
                         st = (is_json_draft(raw) ? "DRAFT" : "PUBLISHED")
-                        printf "ID:        hexagon:%s\nStatus:    %s\nTitle:     %s\nPublished: %s\nAuthors:   %s\nCategory:  %s\nURL:       %s/%s\nPDF:       %s/pdf/%s\nSource:    %s/src/%s/files\nAbstract:\n  %s\n", id, st, title, pub, authors, cat, base_url, id, base_url, id, base_url, id, abs
+                        printf "ID:        hexagon:%s\nStatus:    %s\nTitle:     %s\nPublished: %s\nAuthors:   %s\nSubject:   %s\nPages:     %s\nURL:       %s/abs/%s\nPDF:       %s/pdf/%s\nSource:    %s/src/%s\nAbstract:\n  %s\n", id, st, title, pub, authors, cat, pages, base_url, id, base_url, id, base_url, id, abs
                         exit 0
                     }
 
@@ -162,42 +224,51 @@ __hexagon__() {
         local clean_id="${id#hexagon:}"
         clean_id="${clean_id%.pdf}"
         local base_url="$(__preprint_hexagon_base_url)"
+
+        # If it is a local/staged draft ID, try downloading the preview PDF (/api/v1/submissions/{draftId}/preview/pdf)
+        if __preprint_draft_get "hexagon" "$clean_id" >/dev/null 2>&1; then
+            local token="${HEXAGON_TOKEN:-$(__preprint_get_conf hexagon token)}"
+            if [[ -n "$token" ]]; then
+                local preview_url="${base_url}/api/v1/submissions/${clean_id}/preview/pdf"
+                local dest="hexagon_draft_${clean_id}.pdf"
+                [[ -n "$out_path" ]] && { [[ -d "$out_path" ]] && dest="${out_path%/}/$dest" || dest="$out_path"; }
+                if curl -fL -H "Authorization: Bearer $token" "$preview_url" -o "$dest" 2>/dev/null && [[ -s "$dest" ]]; then
+                    __log "Saved draft preview PDF to '$dest'." -t success -l preprint
+                    return 0
+                fi
+            fi
+        fi
+
         local pdf_url="${base_url}/pdf/${clean_id}"
         __preprint_save_pdf_stream "$pdf_url" "hexagon_${clean_id//\//_}.pdf" "$out_path" "${pdf_url}.pdf"
     }
 
     __preprint_provider_hexagon_list() {
         local max="${1:-0}" sort_by="${2:-time}" reverse="${3:-0}"
-        local limit=$(( max > 0 ? max : 200 ))
-        local base_url profile orcid token auth_header=()
+        local limit=$(( max > 0 ? max : 100 ))
+        local base_url profile orcid
         base_url="$(__preprint_hexagon_base_url)"
         profile="${HEXAGON_PROFILE:-$(__preprint_get_conf hexagon profile)}"
         [[ -z "$profile" ]] && profile="$(__preprint_get_conf hexagon author)"
+        [[ -z "$profile" ]] && profile="$(__preprint_get_conf hexagon user)"
         orcid="${HEXAGON_ORCID:-$(__preprint_get_conf hexagon orcid)}"
         [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid orcid)"
-        token="${HEXAGON_TOKEN:-$(__preprint_get_conf hexagon token)}"
-        [[ -n "$token" ]] && auth_header=(-H "Authorization: Bearer $token")
-
-        if [[ -z "$profile" && -z "$orcid" && -z "$token" ]]; then
-            __log "Set your Hexagon User ID, ORCID iD, or API token first:
-  preprint database set -d hexagon --profile <user_id> --token <token>" -t error -l preprint
-            return 1
-        fi
 
         local resp out=""
+        # Note: /api/v1/works is an anonymous public read endpoint; never send submissionBearer to it!
         if [[ -n "$profile" ]]; then
-            if [[ "$profile" == user_* ]]; then
-                resp=$(curl -fsSL "${auth_header[@]}" "${base_url}/api/v1/users/${profile}/works?include_drafts=true&limit=${limit}" 2>/dev/null)
-            else
-                local enc_prof=$(__preprint_urlencode "$profile")
-                resp=$(curl -fsSL "${auth_header[@]}" "${base_url}/api/v1/works?author=${enc_prof}&include_drafts=true&limit=${limit}" 2>/dev/null)
-            fi
+            local enc_prof=$(__preprint_urlencode "${profile:0:48}")
+            resp=$(curl -fsSL -H "Accept: application/json" "${base_url}/api/v1/works?author=${enc_prof}&limit=${limit}" 2>/dev/null)
             [[ -n "$resp" ]] && out=$(__preprint_parse_hexagon "compact" "$base_url" <<< "$resp" 2>/dev/null)
+            if [[ -z "$out" ]]; then
+                resp=$(curl -fsSL -H "Accept: application/json" "${base_url}/api/v1/works?q=${enc_prof}&limit=${limit}" 2>/dev/null)
+                [[ -n "$resp" ]] && out=$(__preprint_parse_hexagon "compact" "$base_url" <<< "$resp" 2>/dev/null)
+            fi
         fi
 
         if [[ -z "$out" && -n "$orcid" ]]; then
-            local enc_orcid=$(__preprint_urlencode "$orcid")
-            resp=$(curl -fsSL "${auth_header[@]}" "${base_url}/api/v1/works?orcid=${enc_orcid}&include_drafts=true&limit=${limit}" 2>/dev/null)
+            local enc_orcid=$(__preprint_urlencode "${orcid:0:48}")
+            resp=$(curl -fsSL -H "Accept: application/json" "${base_url}/api/v1/works?q=${enc_orcid}&limit=${limit}" 2>/dev/null)
             [[ -n "$resp" ]] && out=$(__preprint_parse_hexagon "compact" "$base_url" <<< "$resp" 2>/dev/null)
         fi
 
@@ -210,198 +281,356 @@ __hexagon__() {
 
     __preprint_provider_hexagon_get() {
         local id="${1#hexagon:}"
-        local base_url token auth_header=()
+        local base_url token
         base_url="$(__preprint_hexagon_base_url)"
         token="${HEXAGON_TOKEN:-$(__preprint_get_conf hexagon token)}"
-        [[ -n "$token" ]] && auth_header=(-H "Authorization: Bearer $token")
 
         local resp
-        resp=$(curl -fsSL "${auth_header[@]}" -H "Accept: application/json" "${base_url}/api/v1/works/${id}" 2>/dev/null)
-        if [[ -z "$resp" ]] || ! __preprint_parse_hexagon "detailed" "$base_url" <<< "$resp" 2>/dev/null; then
-            echo "No entry found in Hexagon Math for '$id'."
-            return 1
+        # 1. If it's a published identifier (YYMM.NNNNN[vN]), query anonymous /api/v1/works/{identifier}
+        if [[ "$id" =~ ^[0-9]{4}\.[0-9]{5}(v[1-9][0-9]*)?$ ]]; then
+            resp=$(curl -fsSL -H "Accept: application/json" "${base_url}/api/v1/works/${id}" 2>/dev/null)
+            if [[ -n "$resp" ]] && __preprint_parse_hexagon "detailed" "$base_url" <<< "$resp" 2>/dev/null; then
+                return 0
+            fi
         fi
+
+        # 2. Otherwise query authenticated /api/v1/submissions/{draftId}
+        if [[ -n "$token" ]]; then
+            resp=$(curl -fsSL -H "Authorization: Bearer $token" -H "Accept: application/json" "${base_url}/api/v1/submissions/${id}" 2>/dev/null)
+            if [[ -n "$resp" ]]; then
+                if __preprint_parse_hexagon "detailed" "$base_url" <<< "$resp" 2>/dev/null; then
+                    return 0
+                fi
+                echo "$resp"
+                return 0
+            fi
+        fi
+
+        __log "No entry found in Hexagon Math for '$id'." -t error -l preprint
+        return 1
     }
 
     __preprint_provider_hexagon_search() {
         local term="$1" limit="${2:-50}" offset="${3:-0}" sort_by="${4:-time}" reverse="${5:-0}"
         local base_url="$(__preprint_hexagon_base_url)"
-        local enc_term=$(__preprint_urlencode "$term")
+        # Respect D1's 50-byte UTF-8 LIKE-pattern limit on /api/v1/works?q=
+        local short_term="${term:0:48}"
+        local enc_term=$(__preprint_urlencode "$short_term")
         local resp out=""
-        resp=$(curl -fsSL -H "Accept: application/json" "${base_url}/api/v1/works?q=${enc_term}&limit=${limit}&offset=${offset}" 2>/dev/null)
+
+        resp=$(curl -fsSL -H "Accept: application/json" "${base_url}/api/v1/works?q=${enc_term}&limit=${limit}" 2>/dev/null)
         [[ -n "$resp" ]] && out=$(__preprint_parse_hexagon "compact" "$base_url" <<< "$resp" 2>/dev/null)
+
+        # Fallback to /api/query (arXiv-compatible Atom feed, supports start & max_results up to 4096 chars)
+        if [[ -z "$out" ]]; then
+            local atom_order="descending"
+            (( reverse == 1 )) && atom_order="ascending"
+            resp=$(curl -fsSL "${base_url}/api/query?search_query=all:${enc_term}&start=${offset}&max_results=${limit}&sortBy=submittedDate&sortOrder=${atom_order}" 2>/dev/null)
+            if [[ -n "$resp" && "$resp" == *"<entry>"* ]]; then
+                out=$(__preprint_parse_arxiv_atom "compact" <<< "$resp" 2>/dev/null)
+            fi
+        fi
+
         [[ -n "$out" ]] && echo "$out" || echo "No entries found in Hexagon Math."
     }
 
-    # Stages a new work as a DRAFT on Hexagon Math
+    # Stages a deposit draft on Hexagon Math following OpenAPI 3.1.0 (/api/v1/submissions):
+    #   Step 1: POST /api/v1/submissions (with Idempotency-Key & SubmissionMetadata) -> draftId
+    #   Step 2: POST /api/v1/submissions/{draftId}/uploads (UploadRequest) -> uploadId
+    #   Step 3: PUT  /api/v1/submissions/{draftId}/uploads/{uploadId}/parts/1 (raw binary)
+    #   Step 4: POST /api/v1/submissions/{draftId}/uploads/{uploadId}/complete
+    #   Step 5: If .zip archive, POST .../expand and POST .../entry-point
     __preprint_provider_hexagon_send() {
         local file="$PREPRINT_SEND_FILE" meta="$PREPRINT_SEND_META" title="$PREPRINT_SEND_TITLE"
         local author="$PREPRINT_SEND_AUTHOR" abstract="$PREPRINT_SEND_ABSTRACT"
-        local category="${PREPRINT_SEND_CATEGORY:-math.GM}"
-        local doi="$PREPRINT_SEND_DOI" journal="$PREPRINT_SEND_JOURNAL" pub_date="$PREPRINT_SEND_DATE"
+        local category="$PREPRINT_SEND_CATEGORY" pub_date="$PREPRINT_SEND_DATE"
+        local arxiv_id="${PREPRINT_SEND_EXT_IDS[arxiv]:-}"
 
-        local base_url token user pass orcid
+        local base_url token sponsor
         base_url="$(__preprint_hexagon_base_url)"
         token="${HEXAGON_TOKEN:-$(__preprint_get_conf hexagon token)}"
-        user="${HEXAGON_USER:-$(__preprint_get_conf hexagon user)}"
-        pass="${HEXAGON_PASS:-$(__preprint_get_conf hexagon pass)}"
-        orcid="${HEXAGON_ORCID:-$(__preprint_get_conf hexagon orcid)}"
-        [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid orcid)"
+        sponsor="${HEXAGON_PROFILE:-$(__preprint_get_conf hexagon profile)}"
+        [[ -z "$sponsor" ]] && sponsor="${HEXAGON_USER:-$(__preprint_get_conf hexagon user)}"
+        [[ -z "$sponsor" ]] && sponsor="${USER:- Researcher}"
 
-        local auth_args=()
-        if [[ -n "$token" ]]; then
-            auth_args=(-H "Authorization: Bearer $token")
-        elif [[ -n "$user" && -n "$pass" ]]; then
-            auth_args=(-u "${user}:${pass}")
-        else
-            __log "Hexagon Math credentials missing. Run: preprint database set -d hexagon --token <TOKEN>" -t error -l preprint
+        if [[ -z "$token" ]]; then
+            __log "Hexagon Math submission bearer token missing. Run: preprint conf set hexagon --token <TOKEN>" -t error -l preprint
             return 1
         fi
 
+        # Hexagon requires .tex source or a .zip source archive (not standalone .pdf).
+        # If the user passed foo.pdf and foo.tex exists in the same directory, automatically use foo.tex!
+        local tmp_zip="" upload_target="$file" upload_kind="source" content_type="text/x-tex"
+        if [[ -d "$file" ]]; then
+            tmp_zip="$(mktemp -u "${TMPDIR:-/tmp}/hexagon_src_XXXXXX.zip")"
+            (cd "$file" && zip -qr "$tmp_zip" . -x "*.git*" "*.pdf" "*.aux" "*.log" "*.out")
+            upload_target="$tmp_zip"
+            upload_kind="source-archive"
+            content_type="application/zip"
+        elif [[ "$file" == *.pdf ]]; then
+            local sibling_tex="${file%.pdf}.tex"
+            if [[ -f "$sibling_tex" ]]; then
+                __log "Hexagon Math compiles from LaTeX source; automatically switching '$file' -> '$sibling_tex'." -t info -l preprint
+                upload_target="$sibling_tex"
+                upload_kind="source"
+                content_type="text/x-tex"
+            else
+                __log "Hexagon Math requires a .tex source file or .zip source archive (got '$file' and no '${sibling_tex}' found)." -t error -l preprint
+                return 1
+            fi
+        elif [[ "$file" == *.zip ]]; then
+            upload_kind="source-archive"
+            content_type="application/zip"
+        elif [[ "$file" == *.tex ]]; then
+            upload_kind="source"
+            content_type="text/x-tex"
+        fi
+
+        # Auto-extract title and abstract from .tex file if not supplied via flags
+        if [[ "$upload_target" == *.tex && -f "$upload_target" ]]; then
+            if [[ -z "$title" ]]; then
+                title=$(LC_ALL=C awk '
+                    match($0, /\\title(\[[^\]]*\])?\{[^}]+\}/) {
+                        s = substr($0, RSTART, RLENGTH)
+                        sub(/^\\title(\[[^\]]*\])?\{/, "", s); sub(/\}$/, "", s)
+                        gsub(/\\[a-zA-Z]+/, "", s); gsub(/[{}]/, "", s)
+                        gsub(/^[ \t]+|[ \t]+$/, "", s)
+                        if (s != "") { print s; exit }
+                    }
+                ' "$upload_target")
+            fi
+            if [[ -z "$abstract" ]]; then
+                abstract=$(LC_ALL=C awk '
+                    /\\begin\{abstract\}/ { in_abs = 1; sub(/^.*\\begin\{abstract\}/, ""); }
+                    /\\end\{abstract\}/   { sub(/\\end\{abstract\}.*$/, ""); out = out " " $0; in_abs = 0; exit }
+                    in_abs { out = out " " $0 }
+                    END {
+                        gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", out)
+                        gsub(/[ \t\r\n]+/, " ", out)
+                        print out
+                    }
+                ' "$upload_target")
+            fi
+        fi
+
         [[ -z "$title" ]] && title="$(basename "${file%.*}")"
-        [[ -z "$author" ]] && author="${USER:-Anonymous}"
-        [[ -z "$abstract" ]] && abstract="Preprint submitted via omni preprint tool."
+        [[ -z "$author" ]] && author="$sponsor"
+        [[ -z "$abstract" ]] && abstract="Preprint manuscript submitted to Hexagon Math."
         [[ -z "$pub_date" ]] && printf -v pub_date "%(%Y-%m-%d)T" -1
+
+        local subject msc_code
+        subject="$(__preprint_hexagon_norm_subject "$category")"
+        msc_code="$(__preprint_hexagon_default_msc "$subject")"
 
         local meta_json=""
         if __preprint_is_raw_payload_meta "$meta"; then
             meta_json=$(<"$meta")
         else
-            local esc_title esc_abs esc_cat contribs_json="" ext_json=""
-            esc_title=$(__preprint_json_escape "$title")
-            esc_abs=$(__preprint_json_escape "$abstract")
-            esc_cat=$(__preprint_json_escape "$category")
+            local esc_title esc_abs esc_subj esc_msc esc_sponsor authors_json="" arxiv_field=""
+            esc_title=$(__preprint_json_escape "${title:0:240}")
+            esc_abs=$(__preprint_json_escape "${abstract:0:8000}")
+            esc_subj=$(__preprint_json_escape "$subject")
+            esc_msc=$(__preprint_json_escape "$msc_code")
+            esc_sponsor=$(__preprint_json_escape "${sponsor:0:180}")
 
-            local IFS=';' a idx=0
+            local IFS=';' a
             for a in $author; do
                 a="${a#"${a%%[![:space:]]*}"}"
                 a="${a%"${a##*[![:space:]]}"}"
                 [[ -z "$a" ]] && continue
-                if (( idx == 0 )) && [[ -n "$orcid" ]]; then
-                    contribs_json+="${contribs_json:+,}{\"name\":\"$(__preprint_json_escape "$a")\",\"orcid\":\"$(__preprint_json_escape "$orcid")\"}"
-                else
-                    contribs_json+="${contribs_json:+,}{\"name\":\"$(__preprint_json_escape "$a")\"}"
-                fi
-                ((idx++))
+                authors_json+="${authors_json:+,}{\"name\":\"$(__preprint_json_escape "$a")\"}"
             done
+            [[ -z "$authors_json" ]] && authors_json="{\"name\":\"${esc_sponsor}\"}"
+            [[ -n "$arxiv_id" ]] && arxiv_field=",\"arxivId\":\"$(__preprint_json_escape "$arxiv_id")\""
 
-            [[ -n "$doi" ]] && ext_json+=",\"doi\":\"$(__preprint_json_escape "$doi")\""
-            [[ -n "${PREPRINT_SEND_EXT_IDS[arxiv]:-}" ]] && ext_json+=",\"arxiv_id\":\"$(__preprint_json_escape "${PREPRINT_SEND_EXT_IDS[arxiv]}")\""
-            [[ -n "${PREPRINT_SEND_EXT_IDS[hal]:-}" ]] && ext_json+=",\"hal_id\":\"$(__preprint_json_escape "${PREPRINT_SEND_EXT_IDS[hal]}")\""
-            [[ -n "$journal" ]] && ext_json+=",\"journal_ref\":\"$(__preprint_json_escape "$journal")\""
-            [[ -n "$pub_date" ]] && ext_json+=",\"publication_date\":\"$(__preprint_json_escape "$pub_date")\""
-
-            meta_json="{\"title\":\"${esc_title}\",\"abstract\":\"${esc_abs}\",\"primary_category\":\"${esc_cat}\",\"contributors\":[${contribs_json}],\"publish\":false,\"status\":\"draft\"${ext_json}}"
+            meta_json="{\"title\":\"${esc_title}\",\"abstract\":\"${esc_abs}\",\"subject\":\"${esc_subj}\",\"mscCodes\":[\"${esc_msc}\"],\"authorshipMode\":\"human\",\"authors\":[${authors_json}],\"submittingContributorIndex\":0,\"sponsorName\":\"${esc_sponsor}\",\"humanUnderstanding\":\"all\",\"correctnessConfirmed\":true,\"communityInterestConfirmed\":true,\"citationsConfirmed\":true,\"license\":\"CC BY 4.0\",\"rightsConfirmed\":true${arxiv_field}}"
         fi
 
-        __log "Staging draft '$file' on Hexagon Math (${base_url}/api/v1/works)..." -t info -l preprint
-        local resp http_code
-        resp=$(curl -sS -w "\n%{http_code}" -X POST "${auth_args[@]}" \
-            -F "metadata=${meta_json};type=application/json" \
-            -F "file=@${file}" \
-            "${base_url}/api/v1/works" 2>&1)
-        http_code="${resp##*$'\n'}"
-        local body="${resp%$'\n'*}"
+        # Generate deterministic Idempotency-Key (8..128 chars) for this file+title
+        local idem_key
+        idem_key="omni-$(printf '%s-%s' "$upload_target" "$title" | cksum | awk '{print $1}')-$(date +%Y%m%d%H)"
 
-        if [[ "$http_code" =~ ^20[012]$ ]]; then
-            local work_id
-            work_id=$(__preprint_parse_hexagon "extract_id" "$base_url" <<< "$body")
-            [[ -z "$work_id" ]] && work_id="draft_$(date +%s)"
-            __preprint_draft_save "hexagon" "$work_id" "$pub_date" "$title" "${author//;/, }" "-" "-"
-            __log "Hexagon Math draft staged (ID: $work_id). Run 'preprint publish $work_id -d hexagon' to publish." -t success -l preprint
-            echo "$body"
-        else
-            __log "Hexagon Math draft upload failed (HTTP $http_code)." -t error -l preprint
+        __log "Step 1/4: Creating Hexagon deposit draft (${base_url}/api/v1/submissions)..." -t info -l preprint
+        local resp http_code body draft_id
+        resp=$(curl -sS -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer $token" \
+            -H "Idempotency-Key: $idem_key" \
+            -H "Content-Type: application/json" \
+            -d "$meta_json" \
+            "${base_url}/api/v1/submissions" 2>&1)
+        http_code="${resp##*$'\n'}"
+        body="${resp%$'\n'*}"
+
+        if [[ ! "$http_code" =~ ^20[01]$ ]]; then
+            [[ -n "$tmp_zip" ]] && rm -f "$tmp_zip"
+            __log "Failed to create Hexagon draft (HTTP $http_code)." -t error -l preprint
             echo "$body" >&2
             return 1
         fi
-    }
 
-    # Publishes ONLY a staged draft on Hexagon Math
-    __preprint_provider_hexagon_publish() {
-        local id="${1#hexagon:}"
-        [[ -z "$id" ]] && { __log "Draft ID required: preprint publish <id> -d hexagon" -t error -l preprint; return 1; }
-
-        local base_url token user pass auth_args=()
-        base_url="$(__preprint_hexagon_base_url)"
-        token="${HEXAGON_TOKEN:-$(__preprint_get_conf hexagon token)}"
-        user="${HEXAGON_USER:-$(__preprint_get_conf hexagon user)}"
-        pass="${HEXAGON_PASS:-$(__preprint_get_conf hexagon pass)}"
-
-        if [[ -n "$token" ]]; then
-            auth_args=(-H "Authorization: Bearer $token")
-        elif [[ -n "$user" && -n "$pass" ]]; then
-            auth_args=(-u "${user}:${pass}")
-        else
-            __log "Hexagon Math credentials missing." -t error -l preprint
+        draft_id=$(__preprint_parse_hexagon "extract_draft_id" "$base_url" <<< "$body")
+        if [[ -z "$draft_id" ]]; then
+            [[ -n "$tmp_zip" ]] && rm -f "$tmp_zip"
+            __log "Could not parse draftId from Hexagon response:" -t error -l preprint
+            echo "$body" >&2
             return 1
         fi
 
-        # Verify remote status is not already published
-        local check_json remote_status
-        check_json=$(curl -fsSL "${auth_args[@]}" -H "Accept: application/json" "${base_url}/api/v1/works/${id}" 2>/dev/null)
-        if [[ -n "$check_json" ]]; then
-            remote_status=$(__preprint_parse_hexagon "check_status" "$base_url" <<< "$check_json")
-            if [[ "$remote_status" == "published" ]] && ! __preprint_draft_get "hexagon" "$id" >/dev/null 2>&1; then
-                __log "Work 'hexagon:${id}' is already published on Hexagon Math." -t error -l preprint
-                return 1
+        local fname fsize upload_req upload_id
+        fname="$(basename "$upload_target")"
+        fsize=$(wc -c < "$upload_target" | tr -d '[:space:]')
+        upload_req="{\"kind\":\"${upload_kind}\",\"filename\":\"$(__preprint_json_escape "$fname")\",\"relativePath\":\"$(__preprint_json_escape "$fname")\",\"contentType\":\"${content_type}\",\"sizeBytes\":${fsize}}"
+
+        __log "Step 2/4: Initializing file upload '$fname' ($fsize bytes) for draft '$draft_id'..." -t info -l preprint
+        resp=$(curl -sS -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            -d "$upload_req" \
+            "${base_url}/api/v1/submissions/${draft_id}/uploads" 2>&1)
+        http_code="${resp##*$'\n'}"
+        body="${resp%$'\n'*}"
+
+        if [[ "$http_code" == "409" ]]; then
+            # Remove existing staged upload at that path and retry
+            local old_uid=$(__preprint_parse_hexagon "extract_upload_id" "$base_url" <<< "$body")
+            if [[ -n "$old_uid" ]]; then
+                curl -sS -X DELETE -H "Authorization: Bearer $token" "${base_url}/api/v1/submissions/${draft_id}/uploads/${old_uid}" >/dev/null 2>&1
+                resp=$(curl -sS -w "\n%{http_code}" -X POST \
+                    -H "Authorization: Bearer $token" \
+                    -H "Content-Type: application/json" \
+                    -d "$upload_req" \
+                    "${base_url}/api/v1/submissions/${draft_id}/uploads" 2>&1)
+                http_code="${resp##*$'\n'}"
+                body="${resp%$'\n'*}"
             fi
         fi
 
-        __log "Publishing draft 'hexagon:${id}' on Hexagon Math..." -t info -l preprint
-        local resp http_code
-        resp=$(curl -sS -w "\n%{http_code}" -X POST "${auth_args[@]}" \
-            -H "Content-Type: application/json" \
-            -d '{"action":"publish","publish":true,"status":"published"}' \
-            "${base_url}/api/v1/works/${id}/publish" 2>&1)
-        http_code="${resp##*$'\n'}"
-        local body="${resp%$'\n'*}"
-
-        if [[ ! "$http_code" =~ ^20[0124]$ ]]; then
-            # Fallback to PATCH /api/v1/works/<id> if /publish endpoint is not separate
-            resp=$(curl -sS -w "\n%{http_code}" -X PATCH "${auth_args[@]}" \
-                -H "Content-Type: application/json" \
-                -d '{"publish":true,"status":"published"}' \
-                "${base_url}/api/v1/works/${id}" 2>&1)
-            http_code="${resp##*$'\n'}"
-            body="${resp%$'\n'*}"
+        if [[ ! "$http_code" =~ ^20[01]$ ]]; then
+            [[ -n "$tmp_zip" ]] && rm -f "$tmp_zip"
+            __log "Failed to initialize upload on Hexagon draft '$draft_id' (HTTP $http_code)." -t error -l preprint
+            echo "$body" >&2
+            return 1
         fi
 
-        if [[ "$http_code" =~ ^20[0124]$ ]]; then
-            __log "Published 'hexagon:${id}' on Hexagon Math (${base_url}/${id})!" -t success -l preprint
+        upload_id=$(__preprint_parse_hexagon "extract_upload_id" "$base_url" <<< "$body")
+
+        __log "Step 3/4: Uploading binary part 1 for upload '$upload_id'..." -t info -l preprint
+        resp=$(curl -sS -w "\n%{http_code}" -X PUT \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @"$upload_target" \
+            "${base_url}/api/v1/submissions/${draft_id}/uploads/${upload_id}/parts/1" 2>&1)
+        http_code="${resp##*$'\n'}"
+        body="${resp%$'\n'*}"
+        [[ -n "$tmp_zip" ]] && rm -f "$tmp_zip"
+
+        if [[ "$http_code" != "200" ]]; then
+            __log "Failed uploading binary part 1 (HTTP $http_code)." -t error -l preprint
+            echo "$body" >&2
+            return 1
+        fi
+
+        __log "Step 4/4: Completing upload '$upload_id'..." -t info -l preprint
+        resp=$(curl -sS -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer $token" \
+            "${base_url}/api/v1/submissions/${draft_id}/uploads/${upload_id}/complete" 2>&1)
+        http_code="${resp##*$'\n'}"
+        body="${resp%$'\n'*}"
+
+        if [[ "$http_code" != "200" ]]; then
+            __log "Failed completing upload '$upload_id' (HTTP $http_code)." -t error -l preprint
+            echo "$body" >&2
+            return 1
+        fi
+
+        # If source-archive (.zip), expand in sandbox and select main .tex entry-point
+        if [[ "$upload_kind" == "source-archive" ]]; then
+            __log "Expanding source archive in Hexagon sandbox..." -t info -l preprint
+            resp=$(curl -sS -w "\n%{http_code}" -X POST \
+                -H "Authorization: Bearer $token" \
+                "${base_url}/api/v1/submissions/${draft_id}/uploads/${upload_id}/expand" 2>&1)
+            http_code="${resp##*$'\n'}"
+            body="${resp%$'\n'*}"
+            if [[ "$http_code" =~ ^20[01]$ ]]; then
+                local main_tex
+                main_tex=$(__preprint_parse_hexagon "extract_entry_tex" "$base_url" <<< "$body")
+                if [[ -n "$main_tex" ]]; then
+                    curl -sS -X POST \
+                        -H "Authorization: Bearer $token" \
+                        -H "Content-Type: application/json" \
+                        -d "{\"relativePath\":\"$(__preprint_json_escape "$main_tex")\"}" \
+                        "${base_url}/api/v1/submissions/${draft_id}/uploads/${upload_id}/entry-point" >/dev/null 2>&1
+                fi
+            fi
+        fi
+
+        __preprint_draft_save "hexagon" "$draft_id" "$pub_date" "$title" "${author//;/, }" "$upload_target" "$subject"
+        __log "Hexagon Math draft staged! Draft ID: $draft_id" -t success -l preprint
+        __log "Run 'preprint ls hexagon' to view drafts, or 'preprint publish $draft_id -d hexagon' to commit & publish." -t info -l preprint
+    }
+
+    # Commits a staged draft via POST /api/v1/submissions/{draftId}/commit
+    __preprint_provider_hexagon_publish() {
+        local draft_id="${1#hexagon:}"
+        [[ -z "$draft_id" ]] && { __log "Draft ID required: preprint publish <draftId> -d hexagon" -t error -l preprint; return 1; }
+
+        local base_url token
+        base_url="$(__preprint_hexagon_base_url)"
+        token="${HEXAGON_TOKEN:-$(__preprint_get_conf hexagon token)}"
+        if [[ -z "$token" ]]; then
+            __log "Hexagon Math submission bearer token missing." -t error -l preprint
+            return 1
+        fi
+
+        __log "Committing Hexagon Math draft '$draft_id' (${base_url}/api/v1/submissions/${draft_id}/commit)..." -t info -l preprint
+        local resp http_code body
+        resp=$(curl -sS -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer $token" \
+            "${base_url}/api/v1/submissions/${draft_id}/commit" 2>&1)
+        http_code="${resp##*$'\n'}"
+        body="${resp%$'\n'*}"
+
+        if [[ "$http_code" =~ ^20[012]$ ]]; then
+            local perm_id
+            perm_id=$(__preprint_parse_hexagon "extract_draft_id" "$base_url" <<< "$body")
+            __log "Hexagon Math deposit committed for publication (HTTP $http_code)${perm_id:+ — Identifier: hexagon:$perm_id}!" -t success -l preprint
+            echo "$body"
             return 0
         else
-            __log "Failed to publish 'hexagon:${id}' on Hexagon Math (HTTP $http_code)." -t error -l preprint
+            __log "Failed to commit Hexagon Math draft '$draft_id' (HTTP $http_code)." -t error -l preprint
             echo "$body" >&2
             return 1
         fi
     }
 
+    # Cancels an unpublished draft via POST /api/v1/submissions/{draftId}/lifecycle {"action":"cancel"}
     __preprint_provider_hexagon_rm() {
-        local id="${1#hexagon:}"
-        [[ -z "$id" ]] && { __log "Work ID required to remove from Hexagon Math." -t error -l preprint; return 1; }
-        local base_url token user pass auth_args=()
+        local draft_id="${1#hexagon:}"
+        [[ -z "$draft_id" ]] && { __log "Draft ID required to cancel/remove from Hexagon Math." -t error -l preprint; return 1; }
+
+        local base_url token
         base_url="$(__preprint_hexagon_base_url)"
         token="${HEXAGON_TOKEN:-$(__preprint_get_conf hexagon token)}"
-        user="${HEXAGON_USER:-$(__preprint_get_conf hexagon user)}"
-        pass="${HEXAGON_PASS:-$(__preprint_get_conf hexagon pass)}"
-
-        if [[ -n "$token" ]]; then
-            auth_args=(-H "Authorization: Bearer $token")
-        elif [[ -n "$user" && -n "$pass" ]]; then
-            auth_args=(-u "${user}:${pass}")
-        else
-            __log "Hexagon Math credentials required to delete works." -t error -l preprint
+        if [[ -z "$token" ]]; then
+            __log "Hexagon Math submission bearer token required." -t error -l preprint
             return 1
         fi
 
-        local resp http_code
-        resp=$(curl -sS -w "\n%{http_code}" -X DELETE "${auth_args[@]}" "${base_url}/api/v1/works/${id}" 2>&1)
+        local resp http_code body
+        resp=$(curl -sS -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            -d '{"action":"cancel"}' \
+            "${base_url}/api/v1/submissions/${draft_id}/lifecycle" 2>&1)
         http_code="${resp##*$'\n'}"
+        body="${resp%$'\n'*}"
+
         if [[ "$http_code" =~ ^20[024]$ ]]; then
-            __log "Removed 'hexagon:${id}' from Hexagon Math." -t success -l preprint
+            __log "Cancelled and removed draft '$draft_id' from Hexagon Math." -t success -l preprint
+            return 0
         else
-            __log "Failed to remove 'hexagon:${id}' (HTTP $http_code)." -t error -l preprint
+            __log "Failed to cancel '$draft_id' on Hexagon Math (HTTP $http_code)." -t error -l preprint
+            echo "$body" >&2
             return 1
         fi
     }
