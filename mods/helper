@@ -95,6 +95,8 @@ __helper__() {
         return 0
     }
 
+    # Invoke an internal provider method: __preprint_call <provider> <method> [args...]
+    # Dispatches to: __preprint_provider_<provider>_<method>
     __preprint_call() {
         local db="$(__preprint_norm_db "$1")" method="$2"
         shift 2
@@ -115,6 +117,8 @@ __helper__() {
         echo "$dir/drafts.tsv"
     }
 
+    # Save or update a staged draft record:
+    #   __preprint_draft_save <db> <id> <date> <title> <authors> [<pkg_path>] [<extra>]
     __preprint_draft_save() {
         local db="$(__preprint_norm_db "$1")" id="$2" date="${3:-N/A}" title="${4:-Untitled}"
         local authors="${5:-Anonymous}" pkg_path="${6:--}" extra="${7:--}"
@@ -143,6 +147,7 @@ __helper__() {
         local tmp="${store}.tmp"
         local pkg_path=""
         pkg_path=$(LC_ALL=C awk -F'\t' -v db="$db" -v id="$id" '$1 == db && $2 == id { print $6; exit }' "$store")
+        # SAFETY GUARD: Only delete cached archives inside our internal hal_drafts directory, NEVER user files!
         local safe_cache_dir="${XDG_DATA_HOME:-$HOME/.local/share}/omni/preprint/hal_drafts/"
         if [[ -n "$pkg_path" && "$pkg_path" == "${safe_cache_dir}"* && -e "$pkg_path" ]]; then
             rm -rf "$pkg_path" 2>/dev/null
@@ -172,6 +177,8 @@ __helper__() {
         ' "$store"
     }
 
+    # Merge remote profile list output with locally tracked drafts (avoiding duplicates,
+    # and ensuring any entry in local draft store is marked [DRAFT])
     __preprint_merge_profile_drafts() {
         local db="$(__preprint_norm_db "$1")" remote_out="$2"
         local local_drafts
@@ -225,7 +232,7 @@ __helper__() {
     }
 
     # =========================================================================
-    # OMNIRC STATE, KV META PARSER & PURE BASH/AWK STRING HELPERS
+    # OMNIRC STATE, KV/TEX META PARSERS & PURE BASH/AWK STRING HELPERS
     # =========================================================================
     __preprint_load_omnirc() {
         declare -gA PREPRINT_CONF 2>/dev/null || true
@@ -328,6 +335,7 @@ __helper__() {
                 k="${BASH_REMATCH[1],,}"
                 v="${BASH_REMATCH[2]}"
                 v="${v#"${v%%[![:space:]]*}"}"
+                v="${v%"${a##*[![:space:]]}"}"
                 v="${v%"${v##*[![:space:]]}"}"
                 v="${v#\"}"; v="${v%\"}"
                 v="${v#\'}"; v="${v%\'}"
@@ -347,6 +355,72 @@ __helper__() {
                 esac
             fi
         done < "$mfile"
+    }
+
+    # Global balanced-brace LaTeX metadata extractor for \title{...}, \author{...}, and \begin{abstract}...\end{abstract}
+    __preprint_extract_tex_meta() {
+        local tex_file="$1" field="$2"
+        [[ -z "$tex_file" || ! -f "$tex_file" ]] && return 1
+        LC_ALL=C awk -v field="$field" '
+            function clean_tex(s) {
+                gsub(/%[^\n]*\n/, " ", s)
+                gsub(/\\(thanks|footnote|inst|affiliation|address|email|orcidlink)\{[^}]*\}/, "", s)
+                gsub(/\\and([ \t\r\n]+|\\)/, "; ", s)
+                gsub(/\\\\/, " ", s)
+                gsub(/\\(textbf|textit|emph|textrm|textsc|mathbf|mathrm)\{/, "{", s)
+                gsub(/[{}]/, "", s)
+                gsub(/^[ \t\r\n;]+|[ \t\r\n;]+$/, "", s)
+                gsub(/[ \t\r\n]+/, " ", s)
+                return s
+            }
+            function extract_cmd(src, cmd,    s, depth, i, c, out, all) {
+                s = src
+                all = ""
+                while (match(s, "\\\\" cmd "(\\[[^\\]]*\\])?[ \t\r\n]*\\{")) {
+                    s = substr(s, RSTART + RLENGTH)
+                    depth = 1
+                    out = ""
+                    for (i = 1; i <= length(s); i++) {
+                        c = substr(s, i, 1)
+                        if (c == "{") depth++
+                        else if (c == "}") {
+                            depth--
+                            if (depth == 0) break
+                        }
+                        out = out c
+                    }
+                    s = substr(s, i + 1)
+                    out = clean_tex(out)
+                    if (out != "") {
+                        if (cmd == "author") all = (all == "" ? out : all "; " out)
+                        else return out
+                    }
+                }
+                return all
+            }
+            {
+                sub(/([^\\]|^)%.*$/, "\\1")
+                raw = raw $0 "\n"
+            }
+            END {
+                if (field == "title") {
+                    print extract_cmd(raw, "title")
+                } else if (field == "author") {
+                    print extract_cmd(raw, "author")
+                } else if (field == "abstract") {
+                    if (match(raw, /\\begin\{abstract\}[\s\S]*?\\end\{abstract\}/)) {
+                        s = substr(raw, RSTART, RLENGTH)
+                        sub(/^\\begin\{abstract\}/, "", s)
+                        sub(/\\end\{abstract\}$/, "", s)
+                        gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s)
+                        gsub(/[ \t\r\n]+/, " ", s)
+                        print s
+                    } else {
+                        print extract_cmd(raw, "abstract")
+                    }
+                }
+            }
+        ' "$tex_file"
     }
 
     __preprint_is_raw_payload_meta() {
@@ -1137,15 +1211,17 @@ EOF
         done
 
         [[ -z "$db" ]] && {
-            __log "Usage: preprint send [<file>] [-c <category>] [--title <t>] [--author <a>] [--meta <file>] -d/--database <provider>" -t error -l preprint
+            __log "Usage: preprint send [<file>] [-c <category>] [-t <title>] [-a <authors>] [-A <abstract>] [-m <meta_file>] -d/--database <provider>" -t error -l preprint
             return 1
         }
         __preprint_require_registered_profile "$db" || return 1
 
+        # 1. Load key:value pairs from -m <meta_file> if supplied
         if [[ -n "$PREPRINT_SEND_META" && -f "$PREPRINT_SEND_META" ]]; then
             __preprint_load_kv_meta "$PREPRINT_SEND_META"
         fi
 
+        # 2. Verify target file existence if required by provider
         local req_file="${PREPRINT_PROVIDER_META["${db}:requires_file"]:-true}"
         if [[ "$req_file" == "true" && -z "$PREPRINT_SEND_FILE" ]]; then
             __log "Usage: preprint send <file> [metadata-options] -d/--database $db" -t error -l preprint
@@ -1156,10 +1232,41 @@ EOF
             return 1
         fi
 
-        local req_cat="${PREPRINT_PROVIDER_META["${db}:requires_category"]:-false}"
-        if [[ "$req_cat" == "true" && -z "$PREPRINT_SEND_CATEGORY" ]] && ! __preprint_is_raw_payload_meta "$PREPRINT_SEND_META"; then
-            __log "Category is required for '$db'. Pass -c/--category <category> (or set 'category:' in -m <meta_file>)." -t error -l preprint
-            return 1
+        # 3. Auto-extract title, author, and abstract from .tex file (or sibling .tex file) when not provided on CLI
+        if [[ -n "$PREPRINT_SEND_FILE" ]]; then
+            local tex_cand=""
+            if [[ "$PREPRINT_SEND_FILE" == *.tex && -f "$PREPRINT_SEND_FILE" ]]; then
+                tex_cand="$PREPRINT_SEND_FILE"
+            elif [[ "$PREPRINT_SEND_FILE" == *.pdf && -f "${PREPRINT_SEND_FILE%.pdf}.tex" ]]; then
+                tex_cand="${PREPRINT_SEND_FILE%.pdf}.tex"
+            fi
+            if [[ -n "$tex_cand" ]]; then
+                [[ -z "$PREPRINT_SEND_TITLE" ]]    && PREPRINT_SEND_TITLE="$(__preprint_extract_tex_meta "$tex_cand" "title")"
+                [[ -z "$PREPRINT_SEND_AUTHOR" ]]   && PREPRINT_SEND_AUTHOR="$(__preprint_extract_tex_meta "$tex_cand" "author")"
+                [[ -z "$PREPRINT_SEND_ABSTRACT" ]] && PREPRINT_SEND_ABSTRACT="$(__preprint_extract_tex_meta "$tex_cand" "abstract")"
+            fi
+        fi
+
+        # 4. GLOBAL METADATA VALIDATION: Block sending for ALL providers if title, author, abstract (or required category) is missing!
+        if ! __preprint_is_raw_payload_meta "$PREPRINT_SEND_META"; then
+            local -a missing_meta=()
+            [[ -z "${PREPRINT_SEND_TITLE//[[:space:]]/}" ]]    && missing_meta+=("title (-t/--title, 'title:' in -m, or \\title{...} in .tex)")
+            [[ -z "${PREPRINT_SEND_AUTHOR//[[:space:]]/}" ]]   && missing_meta+=("authors (-a/--author, 'authors:' in -m, or \\author{...} in .tex)")
+            [[ -z "${PREPRINT_SEND_ABSTRACT//[[:space:]]/}" ]] && missing_meta+=("abstract (-A/--abstract, 'abstract:' in -m, or \\begin{abstract} in .tex)")
+
+            local req_cat="${PREPRINT_PROVIDER_META["${db}:requires_category"]:-false}"
+            if [[ "$req_cat" == "true" && -z "${PREPRINT_SEND_CATEGORY//[[:space:]]/}" ]]; then
+                missing_meta+=("category (-c/--category or 'category:' in -m)")
+            fi
+
+            if (( ${#missing_meta[@]} > 0 )); then
+                __log "Refusing to send to '$db' — missing required metadata:" -t error -l preprint
+                local mm
+                for mm in "${missing_meta[@]}"; do
+                    __log "  - Missing $mm" -t error -l preprint
+                done
+                return 1
+            fi
         fi
 
         __preprint_call "$db" send
