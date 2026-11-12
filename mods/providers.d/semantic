@@ -42,6 +42,44 @@ __semantic__() {
                 }
                 return ""
             }
+            function get_oa_pdf(chunk,    pos, sub_c, u) {
+                pos = index(chunk, "\"openAccessPdf\"")
+                if (pos > 0) {
+                    sub_c = substr(chunk, pos, 1200)
+                    # Stop before externalIds or authors if they follow openAccessPdf
+                    if (match(sub_c, /"(externalIds|authors|abstract|tldr)"[ \t]*:/)) {
+                        sub_c = substr(sub_c, 1, RSTART - 1)
+                    }
+                    u = get_str(sub_c, "url")
+                    if (u ~ /^https?:\/\//) return u
+                }
+                pos = index(chunk, "\"pdfUrls\"")
+                if (pos > 0) {
+                    sub_c = substr(chunk, pos, 800)
+                    if (match(sub_c, /"https?:\/\/[^"]+"/)) {
+                        u = substr(sub_c, RSTART + 1, RLENGTH - 2)
+                        return unesc(u)
+                    }
+                }
+                return ""
+            }
+            function get_arxiv(chunk,    arx, u) {
+                arx = get_str(chunk, "ArXiv")
+                if (arx == "") arx = get_str(chunk, "arxivId")
+                if (arx == "") {
+                    u = get_oa_pdf(chunk)
+                    if (match(u, /arxiv\.org\/(pdf|abs)\/[0-9]{4}\.[0-9]{4,5}(v[0-9]+)?/)) {
+                        arx = substr(u, RSTART, RLENGTH)
+                        sub(/^arxiv\.org\/(pdf|abs)\//, "", arx)
+                    }
+                }
+                return arx
+            }
+            function get_doi(chunk,    d) {
+                d = get_str(chunk, "DOI")
+                if (d == "") d = get_str(chunk, "doi")
+                return d
+            }
             function get_authors(chunk,    s, out, pat, m) {
                 out = ""
                 if (match(chunk, /"authors"[ \t]*:[ \t]*\[[^\]]*\]/)) {
@@ -58,7 +96,22 @@ __semantic__() {
                 if (out == "") out = get_str(chunk, "authorsYear")
                 return out
             }
-            function print_detailed(chunk,    pid, title, pub, venue, cites, url, doi, arx, abs, authors, pdf, oa_chunk) {
+            function extract_paper_chunk(full, tid,    idx, p1, p2, before, after) {
+                idx = index(full, "\"" tid "\"")
+                if (idx == 0) return ""
+                before = substr(full, 1, idx - 1)
+                after = substr(full, idx)
+                # Find start of this paper object
+                p1 = idx
+                while (p1 > 1 && substr(full, p1, 1) != "{") p1--
+                # Grab up to 10000 chars and cut right before the next top-level paperId
+                sub_c = substr(full, p1, 10000)
+                if (match(substr(sub_c, (idx - p1) + length(tid) + 3), /"paperId"[ \t]*:[ \t]*"/)) {
+                    sub_c = substr(sub_c, 1, (idx - p1) + length(tid) + 2 + RSTART - 1)
+                }
+                return sub_c
+            }
+            function print_detailed(chunk,    pid, title, pub, venue, cites, url, doi, arx, abs, authors, pdf) {
                 pid = get_str(chunk, "paperId")
                 if (pid == "") pid = get_str(chunk, "id")
                 if (pid == "") return 0
@@ -71,51 +124,30 @@ __semantic__() {
                 if (cites == "") cites = get_num(chunk, "numCitedBy")
                 if (cites == "") cites = "0"
                 url = get_str(chunk, "url"); if (url == "") url = "https://www.semanticscholar.org/paper/" pid
-                doi = get_str(chunk, "DOI")
-                if (doi == "") doi = get_str(chunk, "doi")
-                if (doi == "") doi = "N/A"
-                arx = get_str(chunk, "ArXiv")
-                if (arx == "") arx = get_str(chunk, "arxivId")
-                if (arx == "") arx = "N/A"
+                doi = get_doi(chunk); if (doi == "") doi = "N/A"
+                arx = get_arxiv(chunk); if (arx == "") arx = "N/A"
                 abs = get_str(chunk, "abstract")
                 if (abs == "") abs = get_str(chunk, "description")
                 if (abs == "") abs = "N/A"
                 authors = get_authors(chunk); if (authors == "") authors = "Unknown Author"
-                pdf = ""
-                if (match(chunk, /"openAccessPdf"[ \t]*:[ \t]*\{[^}]*\}/)) {
-                    oa_chunk = substr(chunk, RSTART, RLENGTH)
-                    pdf = get_str(oa_chunk, "url")
-                }
+                pdf = get_oa_pdf(chunk)
                 if (pdf == "" && arx != "N/A") pdf = "https://arxiv.org/pdf/" arx ".pdf"
                 printf "PaperId:   %s\nTitle:     %s\nPublished: %s\nAuthors:   %s\nVenue:     %s\nCitations: %s\nDOI:       %s\nArXiv:     %s\nURL:       %s\nPDF:       %s\nAbstract:\n  %s\n", pid, title, pub, authors, venue, cites, doi, arx, url, (pdf ? pdf : "N/A"), abs
                 return 1
             }
-            function print_pdf(chunk,    pdf, arx, doi) {
-                pdf = ""
-                if (match(chunk, /"openAccessPdf"[ \t]*:[ \t]*\{[^}]*\}/)) {
-                    pdf = get_str(substr(chunk, RSTART, RLENGTH), "url")
-                }
-                arx = get_str(chunk, "ArXiv")
-                if (arx == "") arx = get_str(chunk, "arxivId")
-                doi = get_str(chunk, "DOI")
-                if (doi == "") doi = get_str(chunk, "doi")
-                printf "%s\t%s\t%s\n", (pdf != "" ? pdf : "-"), (arx != "" ? arx : "-"), (doi != "" ? doi : "-")
+            function print_pdf(chunk,    pdf, arx, doi, title) {
+                pdf = get_oa_pdf(chunk)
+                arx = get_arxiv(chunk)
+                doi = get_doi(chunk)
+                title = get_str(chunk, "title")
+                printf "%s\t%s\t%s\t%s\n", (pdf != "" ? pdf : "-"), (arx != "" ? arx : "-"), (doi != "" ? doi : "-"), (title != "" ? title : "-")
                 return 1
             }
             { raw = raw $0 "\n" }
             END {
-                # If target_id is specified, locate that specific paper chunk in cached/batch JSON
                 if (target_id != "") {
-                    idx = index(raw, "\"" target_id "\"")
-                    if (idx > 0) {
-                        start_pos = (idx > 800 ? idx - 800 : 1)
-                        sub_chunk = substr(raw, start_pos, 8000)
-                        # Trim at the next paperId if present after target_id
-                        rel_idx = index(sub_chunk, "\"" target_id "\"")
-                        after_id = substr(sub_chunk, rel_idx + length(target_id) + 2)
-                        if (match(after_id, /"paperId"[ \t]*:[ \t]*"/)) {
-                            sub_chunk = substr(sub_chunk, 1, rel_idx + length(target_id) + 1 + RSTART - 1)
-                        }
+                    sub_chunk = extract_paper_chunk(raw, target_id)
+                    if (sub_chunk != "") {
                         if (mode == "detailed") {
                             if (print_detailed(sub_chunk)) exit 0
                         } else if (mode == "pdf") {
@@ -167,10 +199,6 @@ __semantic__() {
         '
     }
 
-    # Fetch paper JSON via:
-    #   1. Graph v1 GET /graph/v1/paper/<id>
-    #   2. Legacy v1 GET /v1/paper/<id> (separate rate-limit bucket!)
-    #   3. Graph v1 POST /graph/v1/paper/batch
     __preprint_semantic_fetch_paper_json() {
         local id="$1" fields="$2"
         local token="${SEMANTIC_TOKEN:-${S2_TOKEN:-$(__preprint_get_conf semantic token)}}"
@@ -178,13 +206,14 @@ __semantic__() {
         [[ -n "$token" ]] && auth_hdr=(-H "x-api-key: $token")
 
         local resp=""
-        resp=$(curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/paper/$(__preprint_urlencode "$id")?fields=${fields}" 2>/dev/null)
+        # 1. Legacy v1 endpoint first (rarely rate-limited, returns arxivId, doi, pdfUrls)
+        resp=$(curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/v1/paper/$(__preprint_urlencode "$id")" 2>/dev/null)
         if [[ -z "$resp" || "$resp" != *"\"paperId\""* ]]; then
-            # Fallback 1: Legacy v1 API (https://api.semanticscholar.org/v1/paper/<id>)
-            resp=$(curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/v1/paper/$(__preprint_urlencode "$id")" 2>/dev/null)
+            # 2. Graph v1 GET /graph/v1/paper/<id>
+            resp=$(curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/paper/$(__preprint_urlencode "$id")?fields=${fields}" 2>/dev/null)
         fi
         if [[ -z "$resp" || "$resp" != *"\"paperId\""* ]]; then
-            # Fallback 2: POST /graph/v1/paper/batch
+            # 3. Graph v1 POST /graph/v1/paper/batch
             resp=$(curl -fsSL -X POST "${auth_hdr[@]}" \
                 -H "Content-Type: application/json" \
                 -d "{\"ids\":[\"$(__preprint_json_escape "$id")\"]}" \
@@ -228,7 +257,6 @@ __semantic__() {
         local cache_file="$(__preprint_semantic_cache_file)"
         local out=""
 
-        # 1. Check local search/list cache first (instant, 0 network calls, immune to HTTP 429)
         if [[ -f "$cache_file" ]]; then
             out="$(__preprint_parse_semantic_json "detailed" "$id" < "$cache_file" 2>/dev/null)"
             if [[ -n "$out" ]]; then
@@ -237,7 +265,6 @@ __semantic__() {
             fi
         fi
 
-        # 2. Query S2 APIs (Graph v1 -> Legacy v1 -> Batch v1)
         local fields="paperId,title,abstract,year,publicationDate,venue,citationCount,authors,url,openAccessPdf,externalIds"
         local json
         json="$(__preprint_semantic_fetch_paper_json "$id" "$fields")"
@@ -261,19 +288,16 @@ __semantic__() {
         local -a auth_hdr=()
         [[ -n "$token" ]] && auth_hdr=(-H "x-api-key: $token")
 
-        # Request full metadata fields during search and cache them so selecting an entry in fzf needs 0 extra API requests
         local fields="paperId,title,abstract,year,publicationDate,venue,citationCount,authors,url,openAccessPdf,externalIds"
         local cache_file="$(__preprint_semantic_cache_file)"
         local resp out=""
 
-        # 1. Primary Graph API search
         resp=$(curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/paper/search?query=${enc_term}&offset=${offset}&limit=${limit}&fields=${fields}" 2>/dev/null)
         if [[ -n "$resp" ]]; then
             out=$(__preprint_parse_semantic_json "compact" <<< "$resp" 2>/dev/null)
             [[ -n "$out" ]] && printf '%s' "$resp" > "$cache_file"
         fi
 
-        # 2. Bulk Search API fallback (separate rate-limit bucket on S2)
         if [[ -z "$out" ]]; then
             resp=$(curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/paper/search/bulk?query=${enc_term}&fields=${fields}" 2>/dev/null)
             if [[ -n "$resp" ]]; then
@@ -282,7 +306,6 @@ __semantic__() {
             fi
         fi
 
-        # 3. Autocomplete endpoint fallback
         if [[ -z "$out" ]]; then
             resp=$(curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/paper/autocomplete?query=${enc_term}" 2>/dev/null)
             if [[ -n "$resp" ]]; then
@@ -291,7 +314,6 @@ __semantic__() {
             fi
         fi
 
-        # 4. OpenAlex fallback if all S2 endpoints return HTTP 429
         if [[ -z "$out" ]]; then
             local page=$(( (offset / (limit > 0 ? limit : 25)) + 1 ))
             out=$(__preprint_provider_openalex_search "$term" "$limit" "$page" "$sort_by" "$reverse" 2>/dev/null)
@@ -312,33 +334,64 @@ __semantic__() {
         fi
 
         local cache_file="$(__preprint_semantic_cache_file)"
-        local pdf_url="" arx_id="" doi_id=""
+        local pdf_url="-" arx_id="-" doi_id="-" paper_title="-"
 
-        # 1. Check local cache first
+        # 1. Read PDF URL, ArXiv ID, DOI, and Title from local cache using tab delimiter
         if [[ -f "$cache_file" ]]; then
-            read -r pdf_url arx_id doi_id < <(__preprint_parse_semantic_json "pdf" "$id" < "$cache_file" 2>/dev/null)
+            IFS=$'\t' read -r pdf_url arx_id doi_id paper_title < <(__preprint_parse_semantic_json "pdf" "$id" < "$cache_file" 2>/dev/null)
         fi
 
-        # 2. Fetch from API if not in cache
+        # 2. If cache missed PDF/ArXiv/DOI (e.g., came from autocomplete or direct ID), fetch from API
         if [[ ( -z "$pdf_url" || "$pdf_url" == "-" ) && ( -z "$arx_id" || "$arx_id" == "-" ) && ( -z "$doi_id" || "$doi_id" == "-" ) ]]; then
             local json
-            json="$(__preprint_semantic_fetch_paper_json "$id" "openAccessPdf,externalIds")"
+            json="$(__preprint_semantic_fetch_paper_json "$id" "title,openAccessPdf,externalIds")"
             if [[ -n "$json" ]]; then
-                read -r pdf_url arx_id doi_id < <(__preprint_parse_semantic_json "pdf" <<< "$json")
+                IFS=$'\t' read -r pdf_url arx_id doi_id paper_title < <(__preprint_parse_semantic_json "pdf" <<< "$json")
             fi
         fi
 
+        local dest_name="semantic_${id//\//_}.pdf"
+
+        # 3. Try direct openAccessPdf URL first
         if [[ -n "$pdf_url" && "$pdf_url" != "-" ]]; then
-            __preprint_save_pdf_stream "$pdf_url" "semantic_${id//\//_}.pdf" "$out_path"
-            return $?
-        elif [[ -n "$arx_id" && "$arx_id" != "-" ]]; then
-            __preprint_download_entry "arxiv" "$arx_id" "$out_path"
-            return $?
-        elif [[ -n "$doi_id" && "$doi_id" != "-" ]]; then
-            __preprint_resolve_doi_pdf "$doi_id" "$out_path" "semantic_${id//\//_}.pdf"
-            return $?
+            if __preprint_save_pdf_stream "$pdf_url" "$dest_name" "$out_path"; then
+                return 0
+            fi
+            __log "Direct openAccessPdf failed; trying ArXiv/DOI fallback..." -t info -l preprint
         fi
-        __log "No Open-Access PDF available for Semantic Scholar paper '$id'." -t error -l preprint
+
+        # 4. Try ArXiv ID if present
+        if [[ -n "$arx_id" && "$arx_id" != "-" ]]; then
+            if __preprint_download_entry "arxiv" "$arx_id" "$out_path"; then
+                return 0
+            fi
+        fi
+
+        # 5. Try DOI resolution via OpenAlex/Unpaywall/arXiv
+        if [[ -n "$doi_id" && "$doi_id" != "-" ]]; then
+            if __preprint_resolve_doi_pdf "$doi_id" "$out_path" "$dest_name"; then
+                return 0
+            fi
+        fi
+
+        # 6. Try searching OpenAlex by exact title if the paper is paywalled on S2 without OA link
+        if [[ -n "$paper_title" && "$paper_title" != "-" ]]; then
+            local oa_json oa_pdf
+            oa_json=$(curl -fsSL "https://api.openalex.org/works?search=$(__preprint_urlencode "$paper_title")&per-page=1" 2>/dev/null)
+            oa_pdf=$(LC_ALL=C awk '
+                match($0, /"(pdf_url|oa_url)"[ \t]*:[ \t]*"https?:\/\/[^"]+"/) {
+                    s = substr($0, RSTART, RLENGTH)
+                    sub(/^"(pdf_url|oa_url)"[ \t]*:[ \t]*"/, "", s)
+                    sub(/"$/, "", s)
+                    print s; exit
+                }
+            ' <<< "$oa_json")
+            if [[ -n "$oa_pdf" ]] && __preprint_save_pdf_stream "$oa_pdf" "$dest_name" "$out_path"; then
+                return 0
+            fi
+        fi
+
+        __log "No Open-Access PDF is publicly available for Semantic Scholar paper '$id' (paper may be paywalled)." -t error -l preprint
         return 1
     }
 }
