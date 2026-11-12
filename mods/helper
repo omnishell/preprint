@@ -95,8 +95,6 @@ __helper__() {
         return 0
     }
 
-    # Invoke an internal provider method: __preprint_call <provider> <method> [args...]
-    # Dispatches to: __preprint_provider_<provider>_<method>
     __preprint_call() {
         local db="$(__preprint_norm_db "$1")" method="$2"
         shift 2
@@ -117,8 +115,6 @@ __helper__() {
         echo "$dir/drafts.tsv"
     }
 
-    # Save or update a staged draft record:
-    #   __preprint_draft_save <db> <id> <date> <title> <authors> [<pkg_path>] [<extra>]
     __preprint_draft_save() {
         local db="$(__preprint_norm_db "$1")" id="$2" date="${3:-N/A}" title="${4:-Untitled}"
         local authors="${5:-Anonymous}" pkg_path="${6:--}" extra="${7:--}"
@@ -147,7 +143,10 @@ __helper__() {
         local tmp="${store}.tmp"
         local pkg_path=""
         pkg_path=$(LC_ALL=C awk -F'\t' -v db="$db" -v id="$id" '$1 == db && $2 == id { print $6; exit }' "$store")
-        [[ -n "$pkg_path" && "$pkg_path" != "-" && -e "$pkg_path" ]] && rm -rf "$pkg_path" 2>/dev/null
+        local safe_cache_dir="${XDG_DATA_HOME:-$HOME/.local/share}/omni/preprint/hal_drafts/"
+        if [[ -n "$pkg_path" && "$pkg_path" == "${safe_cache_dir}"* && -e "$pkg_path" ]]; then
+            rm -rf "$pkg_path" 2>/dev/null
+        fi
         LC_ALL=C awk -F'\t' -v db="$db" -v id="$id" '!($1 == db && $2 == id) { print $0 }' "$store" > "$tmp"
         mv "$tmp" "$store"
     }
@@ -173,8 +172,6 @@ __helper__() {
         ' "$store"
     }
 
-    # Merge remote profile list output with locally tracked drafts (avoiding duplicates,
-    # and ensuring any entry in local draft store is marked [DRAFT])
     __preprint_merge_profile_drafts() {
         local db="$(__preprint_norm_db "$1")" remote_out="$2"
         local local_drafts
