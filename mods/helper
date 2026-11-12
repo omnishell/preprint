@@ -9,12 +9,6 @@ __helper__() {
     declare -gA PREPRINT_PROVIDER_ALIASES=()
     declare -gA PREPRINT_PROVIDER_META=()
 
-    # Register a preprint provider plugin:
-    #   __preprint_register_provider <name> \
-    #       [--aliases "a1,a2"] \
-    #       [--pagination "offset|page"] \
-    #       [--requires-file "true|false"] \
-    #       [--desc "Description"]
     __preprint_register_provider() {
         local name="${1,,}"; shift || true
         [[ -z "$name" ]] && return 1
@@ -92,8 +86,6 @@ __helper__() {
         return 0
     }
 
-    # Invoke an internal provider method: __preprint_call <provider> <method> [args...]
-    # Dispatches to: __preprint_provider_<provider>_<method>
     __preprint_call() {
         local db="$(__preprint_norm_db "$1")" method="$2"
         shift 2
@@ -114,8 +106,6 @@ __helper__() {
         echo "$dir/drafts.tsv"
     }
 
-    # Save or update a staged draft record:
-    #   __preprint_draft_save <db> <id> <date> <title> <authors> [<pkg_path>] [<extra>]
     __preprint_draft_save() {
         local db="$(__preprint_norm_db "$1")" id="$2" date="${3:-N/A}" title="${4:-Untitled}"
         local authors="${5:-Anonymous}" pkg_path="${6:--}" extra="${7:--}"
@@ -170,8 +160,6 @@ __helper__() {
         ' "$store"
     }
 
-    # Merge remote profile list output with locally tracked drafts (avoiding duplicates,
-    # and ensuring any entry in local draft store is marked [DRAFT])
     __preprint_merge_profile_drafts() {
         local db="$(__preprint_norm_db "$1")" remote_out="$2"
         local local_drafts
@@ -276,7 +264,6 @@ __helper__() {
         return 1
     }
 
-    # Check whether a provider profile has been configured in PREPRINT_CONF or via ENV
     __preprint_is_profile_registered() {
         local db="$(__preprint_norm_db "$1")"
         __preprint_load_omnirc
@@ -295,7 +282,6 @@ __helper__() {
             done
         fi
 
-        # Check environment variable overrides
         local up="${db^^}"
         local env_p="${up}_PROFILE" env_o="${up}_ORCID" env_t="${up}_TOKEN" env_u="${up}_USER"
         if [[ -n "${!env_p:-}" || -n "${!env_o:-}" || -n "${!env_t:-}" || -n "${!env_u:-}" ]]; then
@@ -359,7 +345,6 @@ __helper__() {
         [[ "$first_char" == "{" || "$first_char" == "[" || "$first_char" == "<" ]]
     }
 
-    # Pure Bash RFC 3986 URL encoder
     __preprint_urlencode() {
         local LC_ALL=C
         local str="$1" i c out="" hex
@@ -373,7 +358,6 @@ __helper__() {
         printf '%s' "$out"
     }
 
-    # Pure Bash JSON string escaper
     __preprint_json_escape() {
         local s="$1"
         s="${s//\\/\\\\}"
@@ -384,7 +368,6 @@ __helper__() {
         printf '%s' "$s"
     }
 
-    # Pure Bash XML string escaper
     __preprint_xml_escape() {
         local s="$1"
         s="${s//&/&amp;}"
@@ -395,7 +378,6 @@ __helper__() {
         printf '%s' "$s"
     }
 
-    # Normalize sort criteria ('time' or 'alpha')
     __preprint_norm_sort() {
         local s="${1,,}"
         case "$s" in
@@ -405,8 +387,6 @@ __helper__() {
         esac
     }
 
-    # Pure awk + sort pipeline for unified compact entry lines:
-    # Format: [<id>] (<YYYY-MM-DD>) [[DRAFT]] <Title>   <Authors>
     __preprint_sort_lines() {
         local sort_by="${1:-time}" rev="${2:-0}"
         sort_by="$(__preprint_norm_sort "$sort_by")"
@@ -439,7 +419,6 @@ __helper__() {
                     sub(/\)[ \t]*$/, "", paren)
                     rest = substr(rest, RLENGTH + 1)
                 }
-                # Strip [DRAFT] badge when extracting the title sort key
                 sub(/^\[DRAFT\][ \t]*/, "", rest)
                 title = rest
                 sub(/[ \t]*   .*$/, "", title)
@@ -474,7 +453,6 @@ __helper__() {
             fi
         fi
 
-        # Normalize arXiv /abs/ links to /pdf/
         if [[ "$pdf_url" =~ ^https?://arxiv\.org/abs/(.+)$ ]]; then
             pdf_url="https://arxiv.org/pdf/${BASH_REMATCH[1]}.pdf"
         fi
@@ -552,9 +530,36 @@ __helper__() {
     }
 
     # =========================================================================
-    # PROFILE & DATABASE CONFIGURATION MANAGEMENT
+    # CONFIGURATION MANAGEMENT ('preprint conf <ls|get|set|rm>')
     # =========================================================================
-    __preprint_profile_get() {
+    __preprint_conf_ls() {
+        __preprint_load_omnirc
+        printf "%-14s %-18s %s\n" "PROVIDER" "STATUS" "CONFIGURED KEYS"
+        printf "%-14s %-18s %s\n" "--------" "------" "---------------"
+        local db pair k v
+        for db in "${PREPRINT_PROVIDERS[@]}"; do
+            if __preprint_is_profile_registered "$db"; then
+                local -a keys=() pairs=()
+                IFS=',' read -ra pairs <<< "${PREPRINT_CONF[$db]:-}"
+                for pair in "${pairs[@]}"; do
+                    k="${pair%%:*}"
+                    v="${pair#*:}"
+                    if [[ "$k" == "pass" || "$k" == "token" ]]; then
+                        keys+=("${k}:*** (${#v} chars)")
+                    elif [[ "$v" == *" "* ]]; then
+                        keys+=("${k}:\"${v}\"")
+                    else
+                        keys+=("${k}:${v}")
+                    fi
+                done
+                printf "%-14s %-18s %s\n" "$db" "registered" "${keys[*]:-(via env)}"
+            else
+                printf "%-14s %-18s %s\n" "$db" "not registered" "-"
+            fi
+        done
+    }
+
+    __preprint_conf_get() {
         __preprint_load_omnirc
         local raw_db=""
         while [[ $# -gt 0 ]]; do
@@ -567,7 +572,7 @@ __helper__() {
         done
 
         if [[ -z "$raw_db" ]]; then
-            __preprint_database ls
+            __preprint_conf_ls
             return $?
         fi
 
@@ -602,7 +607,7 @@ __helper__() {
         printf "Sandbox:   %s\n" "$sandbox"
     }
 
-    __preprint_profile_edit() {
+    __preprint_conf_set() {
         __preprint_load_omnirc
         local raw_db="" has_flags=0
         local -a rem_args=()
@@ -624,7 +629,7 @@ __helper__() {
         set -- "${rem_args[@]}"
 
         if [[ -z "$raw_db" ]]; then
-            __log "Usage: preprint profile edit <provider> [--profile <id>] [--orcid <id>] [--token <tok>] [--user <u>] [--pass <p>] [--sandbox|--no-sandbox]" -t error -l preprint
+            __log "Usage: preprint conf set <provider> [--profile <id>] [--orcid <id>] [--token <tok>] [--user <u>] [--pass <p>] [--sandbox|--no-sandbox]" -t error -l preprint
             return 1
         fi
 
@@ -642,7 +647,7 @@ __helper__() {
         [[ -z "$sandbox" ]] && sandbox="false"
 
         if (( has_flags == 0 )) && [[ -t 0 && -t 1 ]]; then
-            echo "Editing profile for '$db' (press Enter to keep current value, type '-' to clear):"
+            echo "Configuring '$db' (press Enter to keep current value, type '-' to clear):"
             local in_val=""
             read -r -p "  Profile ID [${profile:--}]: " in_val </dev/tty
             [[ "$in_val" == "-" ]] && profile="" || [[ -n "$in_val" ]] && profile="$in_val"
@@ -694,10 +699,82 @@ __helper__() {
 
         PREPRINT_CONF["$db"]="$val"
         __preprint_save_omnirc
-        __log "Profile for '$db' updated." -t success -l preprint
+        __log "Configuration for '$db' updated." -t success -l preprint
     }
 
-    __preprint_profile_list() {
+    __preprint_conf_rm() {
+        __preprint_load_omnirc
+        local raw_db=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -d|--database) raw_db="$2"; shift 2 ;;
+                --database=*)  raw_db="${1#*=}"; shift ;;
+                *) [[ -z "$raw_db" ]] && raw_db="$1"; shift ;;
+            esac
+        done
+        [[ -z "$raw_db" ]] && { __log "Usage: preprint conf rm <provider>" -t error -l preprint; return 1; }
+        local db="$(__preprint_norm_db "$raw_db")"
+        unset "PREPRINT_CONF[$db]"
+        __preprint_save_omnirc
+        __log "Configuration for '$db' removed." -t success -l preprint
+    }
+
+    __preprint_conf() {
+        local action="${1:-ls}"
+        if [[ "$action" == "-h" || "$action" == "--help" ]]; then
+            cat <<'EOF' >&2
+USAGE:
+    preprint conf ls
+    preprint conf get [<provider>]
+    preprint conf set <provider> [--profile <id>] [--orcid <id>] [--token <tok>] [--user <u>] [--pass <p>] [--sandbox|--no-sandbox]
+    preprint conf rm <provider>
+EOF
+            return 0
+        fi
+        shift || true
+
+        case "$action" in
+            ls|list)
+                __preprint_conf_ls "$@"
+                ;;
+            get|show)
+                __preprint_conf_get "$@"
+                ;;
+            set|new|edit)
+                __preprint_conf_set "$@"
+                ;;
+            rm|remove|del|delete)
+                __preprint_conf_rm "$@"
+                ;;
+            *)
+                # If a provider name was passed directly (e.g. 'preprint conf scholar'), show its config
+                if __preprint_is_provider "$action"; then
+                    __preprint_conf_get "$action" "$@"
+                else
+                    __log "Unknown conf command '$action'. Use: preprint conf <ls|get|set|rm> [<provider>]" -t error -l preprint
+                    return 1
+                fi
+                ;;
+        esac
+    }
+
+    # Legacy wrapper so existing scripts or habits using 'preprint profile ...' or 'preprint database ...' still work
+    __preprint_profile_legacy() {
+        local sub="${1:-ls}"; shift || true
+        case "$sub" in
+            ls|list)        __preprint_list "$@" ;;
+            add|send|push)  __preprint_send "$@" ;;
+            rm|remove|del)  __preprint_rm "$@" ;;
+            get|show)       __preprint_conf_get "$@" ;;
+            edit|set)       __preprint_conf_set "$@" ;;
+            *)              __preprint_list "$sub" "$@" ;;
+        esac
+    }
+
+    # =========================================================================
+    # PROFILE ENTRY COMMANDS ('preprint ls', 'preprint rm')
+    # =========================================================================
+    __preprint_list() {
         local db="" max=0 sort_by="time" reverse=0
         while [[ $# -gt 0 ]]; do
             case "$1" in
@@ -714,13 +791,11 @@ __helper__() {
             esac
         done
 
-        # If no provider was specified (e.g. 'preprint profile ls'), show registration status table
         if [[ -z "$db" ]]; then
-            __preprint_database ls
+            __preprint_conf_ls
             return $?
         fi
 
-        # Verify provider is valid and profile is registered
         __preprint_require_registered_profile "$db" || return 1
 
         sort_by="$(__preprint_norm_sort "$sort_by")"
@@ -735,32 +810,7 @@ __helper__() {
         __preprint_sort_lines "$sort_by" "$reverse" <<< "$raw_out"
     }
 
-    __preprint_profile_add() {
-        local db=""
-        local -a forward_args=()
-        while [[ $# -gt 0 ]]; do
-            case "$1" in
-                -d|--database) db="$(__preprint_norm_db "$2")"; shift 2 ;;
-                --database=*)  db="$(__preprint_norm_db "${1#*=}")"; shift ;;
-                *)
-                    if [[ -z "$db" ]] && __preprint_is_provider "$1"; then
-                        db="$(__preprint_norm_db "$1")"
-                    else
-                        forward_args+=("$1")
-                    fi
-                    shift
-                    ;;
-            esac
-        done
-
-        if [[ -z "$db" ]]; then
-            __log "Usage: preprint profile add <provider> [<file>] [metadata-options]" -t error -l preprint
-            return 1
-        fi
-        __preprint_send -d "$db" "${forward_args[@]}"
-    }
-
-    __preprint_profile_rm() {
+    __preprint_rm() {
         local db="" entry_id=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
@@ -779,7 +829,7 @@ __helper__() {
         done
 
         if [[ -z "$db" ]]; then
-            __log "Usage: preprint profile rm <provider> [<entry_id>]" -t error -l preprint
+            __log "Usage: preprint rm [<entry_id>] -d/--database <provider>" -t error -l preprint
             return 1
         fi
         __preprint_require_registered_profile "$db" || return 1
@@ -790,7 +840,7 @@ __helper__() {
                 return 1
             fi
             local entries selected
-            entries="$(__preprint_profile_list "$db")" || return 1
+            entries="$(__preprint_list "$db")" || return 1
             if [[ -z "$entries" || "$entries" == "No "* ]]; then
                 __log "No entries found in '$db' profile." -t info -l preprint
                 return 1
@@ -808,104 +858,8 @@ __helper__() {
         __preprint_draft_rm "$db" "${entry_id#hexagon:}"
     }
 
-    __preprint_profile() {
-        local subcmd="${1:-}"
-        if [[ -z "$subcmd" || "$subcmd" == "-h" || "$subcmd" == "--help" ]]; then
-            cat <<'EOF' >&2
-USAGE:
-    preprint profile list <provider> [-s/--sort <time|alpha>] [-r/--reverse] [-n/--max <N>]
-    preprint profile add <provider> [<file>] [-t <title>] [-a <authors>] [--doi <doi>] [--id <prov:id>]
-    preprint profile rm <provider> [<entry_id>]
-    preprint profile get [<provider>]
-    preprint profile edit <provider> [--profile <id>] [--orcid <id>] [--token <tok>] [--user <u>] [--pass <p>] [--sandbox|--no-sandbox]
-EOF
-            return 0
-        fi
-        shift
-
-        case "$subcmd" in
-            list|ls)
-                __preprint_profile_list "$@"
-                ;;
-            add|new|create|send|push)
-                __preprint_profile_add "$@"
-                ;;
-            rm|remove|del|delete)
-                __preprint_profile_rm "$@"
-                ;;
-            get|show)
-                __preprint_profile_get "$@"
-                ;;
-            edit|set)
-                __preprint_profile_edit "$@"
-                ;;
-            *)
-                __log "Unknown profile command '$subcmd'. Use: preprint profile <list|add|rm|get|edit> <provider>" -t error -l preprint
-                return 1
-                ;;
-        esac
-    }
-
-    __preprint_database() {
-        __preprint_load_omnirc
-        local action="${1:-ls}"; shift || true
-
-        case "$action" in
-            ls|list)
-                printf "%-14s %-18s %s\n" "PROVIDER" "STATUS" "CONFIGURED KEYS"
-                printf "%-14s %-18s %s\n" "--------" "------" "---------------"
-                local db pair k v
-                for db in "${PREPRINT_PROVIDERS[@]}"; do
-                    if __preprint_is_profile_registered "$db"; then
-                        local -a keys=() pairs=()
-                        IFS=',' read -ra pairs <<< "${PREPRINT_CONF[$db]:-}"
-                        for pair in "${pairs[@]}"; do
-                            k="${pair%%:*}"
-                            v="${pair#*:}"
-                            if [[ "$k" == "pass" || "$k" == "token" ]]; then
-                                keys+=("${k}:*** (${#v} chars)")
-                            elif [[ "$v" == *" "* ]]; then
-                                keys+=("${k}:\"${v}\"")
-                            else
-                                keys+=("${k}:${v}")
-                            fi
-                        done
-                        printf "%-14s %-18s %s\n" "$db" "registered" "${keys[*]:-(via env)}"
-                    else
-                        printf "%-14s %-18s %s\n" "$db" "not registered" "-"
-                    fi
-                done
-                ;;
-            set|new|edit)
-                __preprint_profile_edit "$@"
-                ;;
-            get|show)
-                __preprint_profile_get "$@"
-                ;;
-            rm|remove)
-                local raw_db=""
-                while [[ $# -gt 0 ]]; do
-                    case "$1" in
-                        -d|--database) raw_db="$2"; shift 2 ;;
-                        --database=*)  raw_db="${1#*=}"; shift ;;
-                        *) [[ -z "$raw_db" ]] && raw_db="$1"; shift ;;
-                    esac
-                done
-                [[ -z "$raw_db" ]] && { __log "Usage: preprint database rm <provider>" -t error -l preprint; return 1; }
-                local db="$(__preprint_norm_db "$raw_db")"
-                unset "PREPRINT_CONF[$db]"
-                __preprint_save_omnirc
-                __log "Provider '$db' removed." -t success -l preprint
-                ;;
-            *)
-                __log "Unknown database command '$action'. Use: ls, set, or rm." -t error -l preprint
-                return 1
-                ;;
-        esac
-    }
-
     # =========================================================================
-    # GENERIC COMMAND DISPATCHERS
+    # GENERIC COMMAND DISPATCHERS ('get', 'search', 'send', 'publish')
     # =========================================================================
     __preprint_get() {
         local target="" db="" max=0 sort_by="time" reverse=0 download=0 out_path="" used_fzf=0
@@ -940,7 +894,7 @@ EOF
             fi
             local entries fzf_out key selected rev_flag=()
             (( reverse == 1 )) && rev_flag=(-r)
-            entries="$(__preprint_profile_list "$db" -n "$max" -s "$sort_by" "${rev_flag[@]}")" || return 1
+            entries="$(__preprint_list "$db" -n "$max" -s "$sort_by" "${rev_flag[@]}")" || return 1
             if [[ -z "$entries" || "$entries" == "No "* ]]; then
                 __log "No entries found in '$db' profile." -t info -l preprint
                 return 1
@@ -1114,7 +1068,6 @@ EOF
         fi
     }
 
-    # 'preprint send <file> [metadata-options] -d <provider>' stages the submission as a DRAFT
     __preprint_send() {
         local PREPRINT_SEND_FILE="" db="" PREPRINT_SEND_META="" PREPRINT_SEND_TITLE=""
         local PREPRINT_SEND_AUTHOR="" PREPRINT_SEND_ABSTRACT="" PREPRINT_SEND_CATEGORY=""
@@ -1173,7 +1126,7 @@ EOF
         done
 
         [[ -z "$db" ]] && {
-            __log "Usage: preprint send <file> [--title <t>] [--author <a>] [--meta <file>] -d/--database <provider>" -t error -l preprint
+            __log "Usage: preprint send [<file>] [--title <t>] [--author <a>] [--meta <file>] -d/--database <provider>" -t error -l preprint
             return 1
         }
         __preprint_require_registered_profile "$db" || return 1
@@ -1195,7 +1148,6 @@ EOF
         __preprint_call "$db" send
     }
 
-    # 'preprint publish [<id>] -d <provider>' publishes ONLY entries that are in DRAFT state
     __preprint_publish() {
         local target="" db=""
         while [[ $# -gt 0 ]]; do
@@ -1233,10 +1185,9 @@ EOF
         fi
 
         local all_entries draft_entries
-        all_entries="$(__preprint_profile_list "$db" 2>/dev/null)"
+        all_entries="$(__preprint_list "$db" 2>/dev/null)"
         draft_entries=$(LC_ALL=C awk '/\[DRAFT\]/ { print $0 }' <<< "$all_entries")
 
-        # Interactive fzf selection of ONLY [DRAFT] entries when <id> is omitted
         if [[ -z "$target" ]]; then
             if [[ -z "$draft_entries" ]]; then
                 __log "No [DRAFT] entries found in '$db' profile to publish." -t info -l preprint
@@ -1256,7 +1207,6 @@ EOF
                 target="${selected%% *}"
             fi
         else
-            # Verify that the specified <id> is actually in draft state
             local clean_target="${target#hexagon:}"
             local is_listed_published=0 is_listed_draft=0
             if [[ -n "$all_entries" ]]; then
