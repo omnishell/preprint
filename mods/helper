@@ -9,17 +9,25 @@ __helper__() {
     declare -gA PREPRINT_PROVIDER_ALIASES=()
     declare -gA PREPRINT_PROVIDER_META=()
 
+    # Register a preprint provider plugin:
+    #   __preprint_register_provider <name> \
+    #       [--aliases "a1,a2"] \
+    #       [--pagination "offset|page"] \
+    #       [--requires-file "true|false"] \
+    #       [--requires-category "true|false"] \
+    #       [--desc "Description"]
     __preprint_register_provider() {
         local name="${1,,}"; shift || true
         [[ -z "$name" ]] && return 1
 
-        local aliases="" pagination="offset" requires_file="true" desc=""
+        local aliases="" pagination="offset" requires_file="true" requires_category="false" desc=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                --aliases)       aliases="$2"; shift 2 ;;
-                --pagination)    pagination="$2"; shift 2 ;;
-                --requires-file) requires_file="$2"; shift 2 ;;
-                --desc)          desc="$2"; shift 2 ;;
+                --aliases)           aliases="$2"; shift 2 ;;
+                --pagination)        pagination="$2"; shift 2 ;;
+                --requires-file)     requires_file="$2"; shift 2 ;;
+                --requires-category) requires_category="$2"; shift 2 ;;
+                --desc)              desc="$2"; shift 2 ;;
                 *) shift ;;
             esac
         done
@@ -43,6 +51,7 @@ __helper__() {
 
         PREPRINT_PROVIDER_META["${name}:pagination"]="$pagination"
         PREPRINT_PROVIDER_META["${name}:requires_file"]="$requires_file"
+        PREPRINT_PROVIDER_META["${name}:requires_category"]="$requires_category"
         PREPRINT_PROVIDER_META["${name}:desc"]="$desc"
     }
 
@@ -86,6 +95,8 @@ __helper__() {
         return 0
     }
 
+    # Invoke an internal provider method: __preprint_call <provider> <method> [args...]
+    # Dispatches to: __preprint_provider_<provider>_<method>
     __preprint_call() {
         local db="$(__preprint_norm_db "$1")" method="$2"
         shift 2
@@ -106,6 +117,8 @@ __helper__() {
         echo "$dir/drafts.tsv"
     }
 
+    # Save or update a staged draft record:
+    #   __preprint_draft_save <db> <id> <date> <title> <authors> [<pkg_path>] [<extra>]
     __preprint_draft_save() {
         local db="$(__preprint_norm_db "$1")" id="$2" date="${3:-N/A}" title="${4:-Untitled}"
         local authors="${5:-Anonymous}" pkg_path="${6:--}" extra="${7:--}"
@@ -160,6 +173,8 @@ __helper__() {
         ' "$store"
     }
 
+    # Merge remote profile list output with locally tracked drafts (avoiding duplicates,
+    # and ensuring any entry in local draft store is marked [DRAFT])
     __preprint_merge_profile_drafts() {
         local db="$(__preprint_norm_db "$1")" remote_out="$2"
         local local_drafts
@@ -747,7 +762,6 @@ EOF
                 __preprint_conf_rm "$@"
                 ;;
             *)
-                # If a provider name was passed directly (e.g. 'preprint conf scholar'), show its config
                 if __preprint_is_provider "$action"; then
                     __preprint_conf_get "$action" "$@"
                 else
@@ -1126,7 +1140,7 @@ EOF
         done
 
         [[ -z "$db" ]] && {
-            __log "Usage: preprint send [<file>] [--title <t>] [--author <a>] [--meta <file>] -d/--database <provider>" -t error -l preprint
+            __log "Usage: preprint send [<file>] [-c <category>] [--title <t>] [--author <a>] [--meta <file>] -d/--database <provider>" -t error -l preprint
             return 1
         }
         __preprint_require_registered_profile "$db" || return 1
@@ -1142,6 +1156,12 @@ EOF
         fi
         if [[ -n "$PREPRINT_SEND_FILE" && ! -e "$PREPRINT_SEND_FILE" ]]; then
             __log "File or directory not found: '$PREPRINT_SEND_FILE'" -t error -l preprint
+            return 1
+        fi
+
+        local req_cat="${PREPRINT_PROVIDER_META["${db}:requires_category"]:-false}"
+        if [[ "$req_cat" == "true" && -z "$PREPRINT_SEND_CATEGORY" ]] && ! __preprint_is_raw_payload_meta "$PREPRINT_SEND_META"; then
+            __log "Category is required for '$db'. Pass -c/--category <category> (or set 'category:' in -m <meta_file>)." -t error -l preprint
             return 1
         fi
 

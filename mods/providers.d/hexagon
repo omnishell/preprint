@@ -5,6 +5,7 @@ __hexagon__() {
         --aliases "hexagonmath,hexagon-math,hexagon math" \
         --pagination "offset" \
         --requires-file "true" \
+        --requires-category "true" \
         --desc "Hexagon Math preprint server (OpenAPI v1.13: TeX/ZIP draft staging, preview & commit)"
 
     __preprint_hexagon_base_url() {
@@ -17,24 +18,14 @@ __hexagon__() {
         fi
     }
 
-    # Map arbitrary or shorthand categories to Hexagon's allowed math-and-adjacent-v2 subject enum
-    __preprint_hexagon_norm_subject() {
-        local c="${1:-math-ph}"
+    __preprint_hexagon_validate_subject() {
+        local c="${1:-}"
         case "$c" in
             math.AC|math.AG|math.AP|math.AT|math.CA|math.CO|math.CT|math.CV|math.DG|math.DS|math.FA|math.GM|math.GN|math.GR|math.GT|math.HO|math.IT|math.KT|math.LO|math.MG|math.MP|math.NA|math.NT|math.OA|math.OC|math.PR|math.QA|math.RA|math.RT|math.SG|math.SP|math.ST|cs.AI|cs.CC|cs.CG|cs.DM|cs.DS|cs.FL|cs.IT|cs.LO|cs.MS|cs.NA|cs.SC|math-ph|quant-ph|stat.TH)
-                echo "$c"
-                ;;
-            hep-th|hep-ph|gr-qc|nlin*)
-                echo "math-ph"
-                ;;
-            math*)
-                echo "math.GM"
-                ;;
-            cs*)
-                echo "cs.LO"
+                return 0
                 ;;
             *)
-                echo "math.GM"
+                return 1
                 ;;
         esac
     }
@@ -49,6 +40,14 @@ __hexagon__() {
             math.NT)         echo "11F03" ;;
             math.AG)         echo "14A10" ;;
             math.SP)         echo "58J50" ;;
+            math.AP)         echo "35Q40" ;;
+            math.FA)         echo "46L05" ;;
+            math.QA)         echo "17B37" ;;
+            math.RT)         echo "22E46" ;;
+            math.GT)         echo "57M50" ;;
+            math.AT)         echo "55N20" ;;
+            math.CO)         echo "05A15" ;;
+            math.PR)         echo "60B20" ;;
             math.LO|cs.LO)   echo "03B10" ;;
             cs.AI)           echo "68T01" ;;
             *)               echo "00A05" ;;
@@ -158,7 +157,6 @@ __hexagon__() {
                     exit 0
                 }
                 if (mode == "extract_entry_tex") {
-                    # Find first .tex candidate from /expand response
                     if (match(raw, /"[^"]+\.tex"/)) {
                         s = substr(raw, RSTART + 1, RLENGTH - 2)
                         print unesc_json(s)
@@ -225,7 +223,6 @@ __hexagon__() {
         clean_id="${clean_id%.pdf}"
         local base_url="$(__preprint_hexagon_base_url)"
 
-        # If it is a local/staged draft ID, try downloading the preview PDF (/api/v1/submissions/{draftId}/preview/pdf)
         if __preprint_draft_get "hexagon" "$clean_id" >/dev/null 2>&1; then
             local token="${HEXAGON_TOKEN:-$(__preprint_get_conf hexagon token)}"
             if [[ -n "$token" ]]; then
@@ -255,7 +252,6 @@ __hexagon__() {
         [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid orcid)"
 
         local resp out=""
-        # Note: /api/v1/works is an anonymous public read endpoint; never send submissionBearer to it!
         if [[ -n "$profile" ]]; then
             local enc_prof=$(__preprint_urlencode "${profile:0:48}")
             resp=$(curl -fsSL -H "Accept: application/json" "${base_url}/api/v1/works?author=${enc_prof}&limit=${limit}" 2>/dev/null)
@@ -286,7 +282,6 @@ __hexagon__() {
         token="${HEXAGON_TOKEN:-$(__preprint_get_conf hexagon token)}"
 
         local resp
-        # 1. If it's a published identifier (YYMM.NNNNN[vN]), query anonymous /api/v1/works/{identifier}
         if [[ "$id" =~ ^[0-9]{4}\.[0-9]{5}(v[1-9][0-9]*)?$ ]]; then
             resp=$(curl -fsSL -H "Accept: application/json" "${base_url}/api/v1/works/${id}" 2>/dev/null)
             if [[ -n "$resp" ]] && __preprint_parse_hexagon "detailed" "$base_url" <<< "$resp" 2>/dev/null; then
@@ -294,7 +289,6 @@ __hexagon__() {
             fi
         fi
 
-        # 2. Otherwise query authenticated /api/v1/submissions/{draftId}
         if [[ -n "$token" ]]; then
             resp=$(curl -fsSL -H "Authorization: Bearer $token" -H "Accept: application/json" "${base_url}/api/v1/submissions/${id}" 2>/dev/null)
             if [[ -n "$resp" ]]; then
@@ -313,7 +307,6 @@ __hexagon__() {
     __preprint_provider_hexagon_search() {
         local term="$1" limit="${2:-50}" offset="${3:-0}" sort_by="${4:-time}" reverse="${5:-0}"
         local base_url="$(__preprint_hexagon_base_url)"
-        # Respect D1's 50-byte UTF-8 LIKE-pattern limit on /api/v1/works?q=
         local short_term="${term:0:48}"
         local enc_term=$(__preprint_urlencode "$short_term")
         local resp out=""
@@ -321,7 +314,6 @@ __hexagon__() {
         resp=$(curl -fsSL -H "Accept: application/json" "${base_url}/api/v1/works?q=${enc_term}&limit=${limit}" 2>/dev/null)
         [[ -n "$resp" ]] && out=$(__preprint_parse_hexagon "compact" "$base_url" <<< "$resp" 2>/dev/null)
 
-        # Fallback to /api/query (arXiv-compatible Atom feed, supports start & max_results up to 4096 chars)
         if [[ -z "$out" ]]; then
             local atom_order="descending"
             (( reverse == 1 )) && atom_order="ascending"
@@ -334,32 +326,39 @@ __hexagon__() {
         [[ -n "$out" ]] && echo "$out" || echo "No entries found in Hexagon Math."
     }
 
-    # Stages a deposit draft on Hexagon Math following OpenAPI 3.1.0 (/api/v1/submissions):
-    #   Step 1: POST /api/v1/submissions (with Idempotency-Key & SubmissionMetadata) -> draftId
-    #   Step 2: POST /api/v1/submissions/{draftId}/uploads (UploadRequest) -> uploadId
-    #   Step 3: PUT  /api/v1/submissions/{draftId}/uploads/{uploadId}/parts/1 (raw binary)
-    #   Step 4: POST /api/v1/submissions/{draftId}/uploads/{uploadId}/complete
-    #   Step 5: If .zip archive, POST .../expand and POST .../entry-point
     __preprint_provider_hexagon_send() {
         local file="$PREPRINT_SEND_FILE" meta="$PREPRINT_SEND_META" title="$PREPRINT_SEND_TITLE"
         local author="$PREPRINT_SEND_AUTHOR" abstract="$PREPRINT_SEND_ABSTRACT"
         local category="$PREPRINT_SEND_CATEGORY" pub_date="$PREPRINT_SEND_DATE"
         local arxiv_id="${PREPRINT_SEND_EXT_IDS[arxiv]:-}"
 
+        if [[ -z "$category" ]] && ! __preprint_is_raw_payload_meta "$meta"; then
+            __log "Category (-c/--category) is required for Hexagon Math (e.g., -c math-ph, -c math.DG, -c math.SP)." -t error -l preprint
+            return 1
+        fi
+
+        if [[ -n "$category" ]] && ! __preprint_hexagon_validate_subject "$category"; then
+            __log "Invalid Hexagon Math category '$category'. Allowed primary subjects:
+  math.AC, math.AG, math.AP, math.AT, math.CA, math.CO, math.CT, math.CV, math.DG, math.DS,
+  math.FA, math.GM, math.GN, math.GR, math.GT, math.HO, math.IT, math.KT, math.LO, math.MG,
+  math.MP, math.NA, math.NT, math.OA, math.OC, math.PR, math.QA, math.RA, math.RT, math.SG,
+  math.SP, math.ST, cs.AI, cs.CC, cs.CG, cs.DM, cs.DS, cs.FL, cs.IT, cs.LO, cs.MS, cs.NA,
+  cs.SC, math-ph, quant-ph, stat.TH" -t error -l preprint
+            return 1
+        fi
+
         local base_url token sponsor
         base_url="$(__preprint_hexagon_base_url)"
         token="${HEXAGON_TOKEN:-$(__preprint_get_conf hexagon token)}"
         sponsor="${HEXAGON_PROFILE:-$(__preprint_get_conf hexagon profile)}"
         [[ -z "$sponsor" ]] && sponsor="${HEXAGON_USER:-$(__preprint_get_conf hexagon user)}"
-        [[ -z "$sponsor" ]] && sponsor="${USER:- Researcher}"
+        [[ -z "$sponsor" ]] && sponsor="${USER:-Researcher}"
 
         if [[ -z "$token" ]]; then
             __log "Hexagon Math submission bearer token missing. Run: preprint conf set hexagon --token <TOKEN>" -t error -l preprint
             return 1
         fi
 
-        # Hexagon requires .tex source or a .zip source archive (not standalone .pdf).
-        # If the user passed foo.pdf and foo.tex exists in the same directory, automatically use foo.tex!
         local tmp_zip="" upload_target="$file" upload_kind="source" content_type="text/x-tex"
         if [[ -d "$file" ]]; then
             tmp_zip="$(mktemp -u "${TMPDIR:-/tmp}/hexagon_src_XXXXXX.zip")"
@@ -386,7 +385,6 @@ __hexagon__() {
             content_type="text/x-tex"
         fi
 
-        # Auto-extract title and abstract from .tex file if not supplied via flags
         if [[ "$upload_target" == *.tex && -f "$upload_target" ]]; then
             if [[ -z "$title" ]]; then
                 title=$(LC_ALL=C awk '
@@ -418,9 +416,8 @@ __hexagon__() {
         [[ -z "$abstract" ]] && abstract="Preprint manuscript submitted to Hexagon Math."
         [[ -z "$pub_date" ]] && printf -v pub_date "%(%Y-%m-%d)T" -1
 
-        local subject msc_code
-        subject="$(__preprint_hexagon_norm_subject "$category")"
-        msc_code="$(__preprint_hexagon_default_msc "$subject")"
+        local subject="$category"
+        local msc_code="$(__preprint_hexagon_default_msc "$subject")"
 
         local meta_json=""
         if __preprint_is_raw_payload_meta "$meta"; then
@@ -446,12 +443,31 @@ __hexagon__() {
             meta_json="{\"title\":\"${esc_title}\",\"abstract\":\"${esc_abs}\",\"subject\":\"${esc_subj}\",\"mscCodes\":[\"${esc_msc}\"],\"authorshipMode\":\"human\",\"authors\":[${authors_json}],\"submittingContributorIndex\":0,\"sponsorName\":\"${esc_sponsor}\",\"humanUnderstanding\":\"all\",\"correctnessConfirmed\":true,\"communityInterestConfirmed\":true,\"citationsConfirmed\":true,\"license\":\"CC BY 4.0\",\"rightsConfirmed\":true${arxiv_field}}"
         fi
 
-        # Generate deterministic Idempotency-Key (8..128 chars) for this file+title
+        # If a draft for this file already exists locally, PATCH its metadata in-place first
+        local existing_draft_id=""
+        existing_draft_id=$(LC_ALL=C awk -F'\t' -v f="$upload_target" '$1 == "hexagon" && $6 == f { print $2; exit }' "$(__preprint_draft_store_file)" 2>/dev/null)
+
+        local resp http_code body draft_id=""
+        if [[ -n "$existing_draft_id" ]]; then
+            __log "Updating existing Hexagon draft '$existing_draft_id' metadata (category: $subject)..." -t info -l preprint
+            resp=$(curl -sS -w "\n%{http_code}" -X PATCH \
+                -H "Authorization: Bearer $token" \
+                -H "Content-Type: application/json" \
+                -d "$meta_json" \
+                "${base_url}/api/v1/submissions/${existing_draft_id}" 2>&1)
+            http_code="${resp##*$'\n'}"
+            body="${resp%$'\n'*}"
+            if [[ "$http_code" == "200" ]]; then
+                __preprint_draft_save "hexagon" "$existing_draft_id" "$pub_date" "$title" "${author//;/, }" "$upload_target" "$subject"
+                __log "Updated Hexagon draft '$existing_draft_id' with category '$subject'!" -t success -l preprint
+                return 0
+            fi
+        fi
+
         local idem_key
-        idem_key="omni-$(printf '%s-%s' "$upload_target" "$title" | cksum | awk '{print $1}')-$(date +%Y%m%d%H)"
+        idem_key="omni-$(printf '%s-%s-%s' "$upload_target" "$title" "$subject" | cksum | awk '{print $1}')-$(date +%Y%m%d%H)"
 
         __log "Step 1/4: Creating Hexagon deposit draft (${base_url}/api/v1/submissions)..." -t info -l preprint
-        local resp http_code body draft_id
         resp=$(curl -sS -w "\n%{http_code}" -X POST \
             -H "Authorization: Bearer $token" \
             -H "Idempotency-Key: $idem_key" \
@@ -491,7 +507,6 @@ __hexagon__() {
         body="${resp%$'\n'*}"
 
         if [[ "$http_code" == "409" ]]; then
-            # Remove existing staged upload at that path and retry
             local old_uid=$(__preprint_parse_hexagon "extract_upload_id" "$base_url" <<< "$body")
             if [[ -n "$old_uid" ]]; then
                 curl -sS -X DELETE -H "Authorization: Bearer $token" "${base_url}/api/v1/submissions/${draft_id}/uploads/${old_uid}" >/dev/null 2>&1
@@ -543,7 +558,6 @@ __hexagon__() {
             return 1
         fi
 
-        # If source-archive (.zip), expand in sandbox and select main .tex entry-point
         if [[ "$upload_kind" == "source-archive" ]]; then
             __log "Expanding source archive in Hexagon sandbox..." -t info -l preprint
             resp=$(curl -sS -w "\n%{http_code}" -X POST \
@@ -565,11 +579,10 @@ __hexagon__() {
         fi
 
         __preprint_draft_save "hexagon" "$draft_id" "$pub_date" "$title" "${author//;/, }" "$upload_target" "$subject"
-        __log "Hexagon Math draft staged! Draft ID: $draft_id" -t success -l preprint
+        __log "Hexagon Math draft staged! Draft ID: $draft_id (Category: $subject)" -t success -l preprint
         __log "Run 'preprint ls hexagon' to view drafts, or 'preprint publish $draft_id -d hexagon' to commit & publish." -t info -l preprint
     }
 
-    # Commits a staged draft via POST /api/v1/submissions/{draftId}/commit
     __preprint_provider_hexagon_publish() {
         local draft_id="${1#hexagon:}"
         [[ -z "$draft_id" ]] && { __log "Draft ID required: preprint publish <draftId> -d hexagon" -t error -l preprint; return 1; }
@@ -603,7 +616,6 @@ __hexagon__() {
         fi
     }
 
-    # Cancels an unpublished draft via POST /api/v1/submissions/{draftId}/lifecycle {"action":"cancel"}
     __preprint_provider_hexagon_rm() {
         local draft_id="${1#hexagon:}"
         [[ -z "$draft_id" ]] && { __log "Draft ID required to cancel/remove from Hexagon Math." -t error -l preprint; return 1; }
