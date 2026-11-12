@@ -9,6 +9,13 @@ __helper__() {
     declare -gA PREPRINT_PROVIDER_ALIASES=()
     declare -gA PREPRINT_PROVIDER_META=()
 
+    # Register a preprint provider plugin:
+    #   __preprint_register_provider <name> \
+    #       [--aliases "a1,a2"] \
+    #       [--pagination "offset|page"] \
+    #       [--requires-file "true|false"] \
+    #       [--requires-category "true|false"] \
+    #       [--desc "Description"]
     __preprint_register_provider() {
         local name="${1,,}"; shift || true
         [[ -z "$name" ]] && return 1
@@ -88,6 +95,8 @@ __helper__() {
         return 0
     }
 
+    # Invoke an internal provider method: __preprint_call <provider> <method> [args...]
+    # Dispatches to: __preprint_provider_<provider>_<method>
     __preprint_call() {
         local db="$(__preprint_norm_db "$1")" method="$2"
         shift 2
@@ -108,6 +117,8 @@ __helper__() {
         echo "$dir/drafts.tsv"
     }
 
+    # Save or update a staged draft record:
+    #   __preprint_draft_save <db> <id> <date> <title> <authors> [<pkg_path>] [<extra>]
     __preprint_draft_save() {
         local db="$(__preprint_norm_db "$1")" id="$2" date="${3:-N/A}" title="${4:-Untitled}"
         local authors="${5:-Anonymous}" pkg_path="${6:--}" extra="${7:--}"
@@ -166,6 +177,8 @@ __helper__() {
         ' "$store"
     }
 
+    # Merge remote profile list output with locally tracked drafts (avoiding duplicates,
+    # and ensuring any entry in local draft store is marked [DRAFT])
     __preprint_merge_profile_drafts() {
         local db="$(__preprint_norm_db "$1")" remote_out="$2"
         local local_drafts
@@ -410,10 +423,10 @@ __helper__() {
                 } else if (field == "author") {
                     print extract_cmd(raw, "author")
                 } else if (field == "abstract") {
-                    if (match(raw, /\\begin\{abstract\}[\s\S]*?\\end\{abstract\}/)) {
-                        s = substr(raw, RSTART, RLENGTH)
-                        sub(/^\\begin\{abstract\}/, "", s)
-                        sub(/\\end\{abstract\}$/, "", s)
+                    b_idx = index(raw, "\\begin{abstract}")
+                    e_idx = index(raw, "\\end{abstract}")
+                    if (b_idx > 0 && e_idx > b_idx) {
+                        s = substr(raw, b_idx + 16, e_idx - (b_idx + 16))
                         gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s)
                         gsub(/[ \t\r\n]+/, " ", s)
                         print s
@@ -880,6 +893,7 @@ EOF
         esac
     }
 
+    # Legacy wrapper so existing scripts or habits using 'preprint profile ...' or 'preprint database ...' still work
     __preprint_profile_legacy() {
         local sub="${1:-ls}"; shift || true
         case "$sub" in
@@ -1287,9 +1301,9 @@ EOF
         if ! __preprint_is_raw_payload_meta "$PREPRINT_SEND_META"; then
             local -a missing_meta=()
             if [[ "$PREPRINT_SEND_FILE" == *.tex ]]; then
-                [[ -z "${PREPRINT_SEND_TITLE//[[:space:]]/}" ]]    && missing_meta+=("--title (-t) [could not auto-collect \\title{...} from '$PREPRINT_SEND_FILE']")
-                [[ -z "${PREPRINT_SEND_AUTHOR//[[:space:]]/}" ]]   && missing_meta+=("--author (-a) [could not auto-collect \\author{...} from '$PREPRINT_SEND_FILE']")
-                [[ -z "${PREPRINT_SEND_ABSTRACT//[[:space:]]/}" ]] && missing_meta+=("--abstract (-A) [could not auto-collect \\begin{abstract} from '$PREPRINT_SEND_FILE']")
+                [[ -z "${PREPRINT_SEND_TITLE//[[:space:]]/}" ]]    && missing_meta+=("--title (-t) [could not auto-collect title from '$PREPRINT_SEND_FILE']")
+                [[ -z "${PREPRINT_SEND_AUTHOR//[[:space:]]/}" ]]   && missing_meta+=("--author (-a) [could not auto-collect author from '$PREPRINT_SEND_FILE']")
+                [[ -z "${PREPRINT_SEND_ABSTRACT//[[:space:]]/}" ]] && missing_meta+=("--abstract (-A) [could not auto-collect abstract from '$PREPRINT_SEND_FILE']")
             else
                 [[ -z "${PREPRINT_SEND_TITLE//[[:space:]]/}" ]]    && missing_meta+=("--title (-t) [required when file is not .tex]")
                 [[ -z "${PREPRINT_SEND_AUTHOR//[[:space:]]/}" ]]   && missing_meta+=("--author (-a) [required when file is not .tex]")
