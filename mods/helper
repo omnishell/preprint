@@ -9,13 +9,6 @@ __helper__() {
     declare -gA PREPRINT_PROVIDER_ALIASES=()
     declare -gA PREPRINT_PROVIDER_META=()
 
-    # Register a preprint provider plugin:
-    #   __preprint_register_provider <name> \
-    #       [--aliases "a1,a2"] \
-    #       [--pagination "offset|page"] \
-    #       [--requires-file "true|false"] \
-    #       [--requires-category "true|false"] \
-    #       [--desc "Description"]
     __preprint_register_provider() {
         local name="${1,,}"; shift || true
         [[ -z "$name" ]] && return 1
@@ -95,8 +88,6 @@ __helper__() {
         return 0
     }
 
-    # Invoke an internal provider method: __preprint_call <provider> <method> [args...]
-    # Dispatches to: __preprint_provider_<provider>_<method>
     __preprint_call() {
         local db="$(__preprint_norm_db "$1")" method="$2"
         shift 2
@@ -117,8 +108,6 @@ __helper__() {
         echo "$dir/drafts.tsv"
     }
 
-    # Save or update a staged draft record:
-    #   __preprint_draft_save <db> <id> <date> <title> <authors> [<pkg_path>] [<extra>]
     __preprint_draft_save() {
         local db="$(__preprint_norm_db "$1")" id="$2" date="${3:-N/A}" title="${4:-Untitled}"
         local authors="${5:-Anonymous}" pkg_path="${6:--}" extra="${7:--}"
@@ -177,8 +166,6 @@ __helper__() {
         ' "$store"
     }
 
-    # Merge remote profile list output with locally tracked drafts (avoiding duplicates,
-    # and ensuring any entry in local draft store is marked [DRAFT])
     __preprint_merge_profile_drafts() {
         local db="$(__preprint_norm_db "$1")" remote_out="$2"
         local local_drafts
@@ -341,6 +328,8 @@ __helper__() {
                 case "$k" in
                     title)                        [[ -z "$PREPRINT_SEND_TITLE" ]] && PREPRINT_SEND_TITLE="$v" ;;
                     author|authors|creators)      [[ -z "$PREPRINT_SEND_AUTHOR" ]] && PREPRINT_SEND_AUTHOR="$v" ;;
+                    affiliation|affiliations|address) [[ -z "${PREPRINT_SEND_AFFILIATIONS:-}" ]] && PREPRINT_SEND_AFFILIATIONS="$v" ;;
+                    email|emails)                 [[ -z "${PREPRINT_SEND_EMAILS:-}" ]] && PREPRINT_SEND_EMAILS="$v" ;;
                     abstract|summary|description) [[ -z "$PREPRINT_SEND_ABSTRACT" ]] && PREPRINT_SEND_ABSTRACT="$v" ;;
                     category|domain|subject)      [[ -z "$PREPRINT_SEND_CATEGORY" ]] && PREPRINT_SEND_CATEGORY="$v" ;;
                     msc|subjclass|msccodes)       [[ -z "${PREPRINT_SEND_MSC:-}" ]] && PREPRINT_SEND_MSC="$v" ;;
@@ -358,7 +347,7 @@ __helper__() {
         done < "$mfile"
     }
 
-    # Global balanced-brace LaTeX metadata extractor for \title{...}, \author{...}, \begin{abstract}, \subjclass, and \keywords
+    # Global balanced-brace LaTeX metadata extractor for \title, \author, \address/\affiliation, \email, \begin{abstract}, \subjclass, and \keywords
     __preprint_extract_tex_meta() {
         local tex_file="$1" field="$2"
         [[ -z "$tex_file" || ! -f "$tex_file" ]] && return 1
@@ -369,9 +358,18 @@ __helper__() {
                 gsub(/\$[\^_][^\$]+\$/, "", s)
                 gsub(/\\and([ \t\r\n]+|\\)/, "; ", s)
                 gsub(/\\\\/, " ", s)
-                gsub(/\\(textbf|textit|emph|textrm|textsc|mathbf|mathrm)\{/, "{", s)
+                gsub(/\\(textbf|textit|emph|textrm|textsc|texttt|mathbf|mathrm)\{/, "{", s)
                 gsub(/[{}]/, "", s)
                 gsub(/^[ \t\r\n;]+|[ \t\r\n;]+$/, "", s)
+                gsub(/[ \t\r\n]+/, " ", s)
+                return s
+            }
+            function clean_affil(s) {
+                gsub(/%[^\n]*\n/, " ", s)
+                gsub(/\\\\/, ", ", s)
+                gsub(/\\(textbf|textit|emph|textrm|textsc|texttt)\{/, "{", s)
+                gsub(/[{}]/, "", s)
+                gsub(/^[ \t\r\n,;]+|[ \t\r\n,;]+$/, "", s)
                 gsub(/[ \t\r\n]+/, " ", s)
                 return s
             }
@@ -403,6 +401,9 @@ __helper__() {
                     if (cmd == "keywords") {
                         out = clean_keywords(out)
                         if (out != "") return out
+                    } else if (cmd == "address" || cmd == "affiliation" || cmd == "email") {
+                        out = clean_affil(out)
+                        if (out != "") all = (all == "" ? out : all "; " out)
                     } else {
                         out = clean_tex(out)
                         if (out != "") {
@@ -422,6 +423,12 @@ __helper__() {
                     print extract_cmd(raw, "title")
                 } else if (field == "author") {
                     print extract_cmd(raw, "author")
+                } else if (field == "affiliation") {
+                    res = extract_cmd(raw, "address")
+                    if (res == "") res = extract_cmd(raw, "affiliation")
+                    print res
+                } else if (field == "email") {
+                    print extract_cmd(raw, "email")
                 } else if (field == "abstract") {
                     b_idx = index(raw, "\\begin{abstract}")
                     e_idx = index(raw, "\\end{abstract}")
@@ -893,7 +900,6 @@ EOF
         esac
     }
 
-    # Legacy wrapper so existing scripts or habits using 'preprint profile ...' or 'preprint database ...' still work
     __preprint_profile_legacy() {
         local sub="${1:-ls}"; shift || true
         case "$sub" in
@@ -1205,7 +1211,8 @@ EOF
 
     __preprint_send() {
         local PREPRINT_SEND_FILE="" db="" PREPRINT_SEND_META="" PREPRINT_SEND_TITLE=""
-        local PREPRINT_SEND_AUTHOR="" PREPRINT_SEND_ABSTRACT="" PREPRINT_SEND_CATEGORY=""
+        local PREPRINT_SEND_AUTHOR="" PREPRINT_SEND_AFFILIATIONS="" PREPRINT_SEND_EMAILS=""
+        local PREPRINT_SEND_ABSTRACT="" PREPRINT_SEND_CATEGORY=""
         local PREPRINT_SEND_MSC="" PREPRINT_SEND_KEYWORDS=""
         local PREPRINT_SEND_DOI="" PREPRINT_SEND_URL="" PREPRINT_SEND_JOURNAL=""
         local PREPRINT_SEND_TYPE="preprint" PREPRINT_SEND_DATE="" auto_yes=0
@@ -1213,33 +1220,37 @@ EOF
 
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                -d|--database) db="$(__preprint_norm_db "$2")"; shift 2 ;;
-                --database=*)  db="$(__preprint_norm_db "${1#*=}")"; shift ;;
-                -y|--yes)      auto_yes=1; shift ;;
-                -m|--meta)     PREPRINT_SEND_META="$2"; shift 2 ;;
-                --meta=*)      PREPRINT_SEND_META="${1#*=}"; shift ;;
-                -t|--title)    PREPRINT_SEND_TITLE="$2"; shift 2 ;;
-                --title=*)     PREPRINT_SEND_TITLE="${1#*=}"; shift ;;
-                -a|--author)   PREPRINT_SEND_AUTHOR="$2"; shift 2 ;;
-                --author=*)    PREPRINT_SEND_AUTHOR="${1#*=}"; shift ;;
-                -A|--abstract) PREPRINT_SEND_ABSTRACT="$2"; shift 2 ;;
-                --abstract=*)  PREPRINT_SEND_ABSTRACT="${1#*=}"; shift ;;
-                -c|--category) PREPRINT_SEND_CATEGORY="$2"; shift 2 ;;
-                --category=*)  PREPRINT_SEND_CATEGORY="${1#*=}"; shift ;;
-                --msc)         PREPRINT_SEND_MSC="$2"; shift 2 ;;
-                --msc=*)       PREPRINT_SEND_MSC="${1#*=}"; shift ;;
-                --keywords)    PREPRINT_SEND_KEYWORDS="$2"; shift 2 ;;
-                --keywords=*)  PREPRINT_SEND_KEYWORDS="${1#*=}"; shift ;;
-                --doi)         PREPRINT_SEND_DOI="$2"; PREPRINT_SEND_EXT_IDS["doi"]="$2"; shift 2 ;;
-                --doi=*)       PREPRINT_SEND_DOI="${1#*=}"; PREPRINT_SEND_EXT_IDS["doi"]="${1#*=}"; shift ;;
-                --url)         PREPRINT_SEND_URL="$2"; shift 2 ;;
-                --url=*)       PREPRINT_SEND_URL="${1#*=}"; shift ;;
-                --journal)     PREPRINT_SEND_JOURNAL="$2"; shift 2 ;;
-                --journal=*)   PREPRINT_SEND_JOURNAL="${1#*=}"; shift ;;
-                --type)        PREPRINT_SEND_TYPE="$2"; shift 2 ;;
-                --type=*)      PREPRINT_SEND_TYPE="${1#*=}"; shift ;;
-                --date)        PREPRINT_SEND_DATE="$2"; shift 2 ;;
-                --date=*)      PREPRINT_SEND_DATE="${1#*=}"; shift ;;
+                -d|--database)    db="$(__preprint_norm_db "$2")"; shift 2 ;;
+                --database=*)     db="$(__preprint_norm_db "${1#*=}")"; shift ;;
+                -y|--yes)         auto_yes=1; shift ;;
+                -m|--meta)        PREPRINT_SEND_META="$2"; shift 2 ;;
+                --meta=*)         PREPRINT_SEND_META="${1#*=}"; shift ;;
+                -t|--title)       PREPRINT_SEND_TITLE="$2"; shift 2 ;;
+                --title=*)        PREPRINT_SEND_TITLE="${1#*=}"; shift ;;
+                -a|--author)      PREPRINT_SEND_AUTHOR="$2"; shift 2 ;;
+                --author=*)       PREPRINT_SEND_AUTHOR="${1#*=}"; shift ;;
+                --affiliation|--address) PREPRINT_SEND_AFFILIATIONS="$2"; shift 2 ;;
+                --affiliation=*|--address=*) PREPRINT_SEND_AFFILIATIONS="${1#*=}"; shift ;;
+                --email)          PREPRINT_SEND_EMAILS="$2"; shift 2 ;;
+                --email=*)        PREPRINT_SEND_EMAILS="${1#*=}"; shift ;;
+                -A|--abstract)    PREPRINT_SEND_ABSTRACT="$2"; shift 2 ;;
+                --abstract=*)     PREPRINT_SEND_ABSTRACT="${1#*=}"; shift ;;
+                -c|--category)    PREPRINT_SEND_CATEGORY="$2"; shift 2 ;;
+                --category=*)     PREPRINT_SEND_CATEGORY="${1#*=}"; shift ;;
+                --msc)            PREPRINT_SEND_MSC="$2"; shift 2 ;;
+                --msc=*)          PREPRINT_SEND_MSC="${1#*=}"; shift ;;
+                --keywords)       PREPRINT_SEND_KEYWORDS="$2"; shift 2 ;;
+                --keywords=*)     PREPRINT_SEND_KEYWORDS="${1#*=}"; shift ;;
+                --doi)            PREPRINT_SEND_DOI="$2"; PREPRINT_SEND_EXT_IDS["doi"]="$2"; shift 2 ;;
+                --doi=*)          PREPRINT_SEND_DOI="${1#*=}"; PREPRINT_SEND_EXT_IDS["doi"]="${1#*=}"; shift ;;
+                --url)            PREPRINT_SEND_URL="$2"; shift 2 ;;
+                --url=*)          PREPRINT_SEND_URL="${1#*=}"; shift ;;
+                --journal)        PREPRINT_SEND_JOURNAL="$2"; shift 2 ;;
+                --journal=*)      PREPRINT_SEND_JOURNAL="${1#*=}"; shift ;;
+                --type)           PREPRINT_SEND_TYPE="$2"; shift 2 ;;
+                --type=*)         PREPRINT_SEND_TYPE="${1#*=}"; shift ;;
+                --date)           PREPRINT_SEND_DATE="$2"; shift 2 ;;
+                --date=*)         PREPRINT_SEND_DATE="${1#*=}"; shift ;;
                 --id)
                     if [[ "$2" == *:* ]]; then
                         local k="$(__preprint_norm_db "${2%%:*}")"
@@ -1288,13 +1299,15 @@ EOF
             return 1
         fi
 
-        # 3. Auto-extract title, author, abstract, MSC, and keywords ONLY when the passed file is a .tex file
+        # 3. Auto-extract title, author, affiliations, emails, abstract, MSC, and keywords ONLY when the passed file is a .tex file
         if [[ -n "$PREPRINT_SEND_FILE" && "$PREPRINT_SEND_FILE" == *.tex && -f "$PREPRINT_SEND_FILE" ]]; then
-            [[ -z "$PREPRINT_SEND_TITLE" ]]    && PREPRINT_SEND_TITLE="$(__preprint_extract_tex_meta "$PREPRINT_SEND_FILE" "title")"
-            [[ -z "$PREPRINT_SEND_AUTHOR" ]]   && PREPRINT_SEND_AUTHOR="$(__preprint_extract_tex_meta "$PREPRINT_SEND_FILE" "author")"
-            [[ -z "$PREPRINT_SEND_ABSTRACT" ]] && PREPRINT_SEND_ABSTRACT="$(__preprint_extract_tex_meta "$PREPRINT_SEND_FILE" "abstract")"
-            [[ -z "$PREPRINT_SEND_MSC" ]]      && PREPRINT_SEND_MSC="$(__preprint_extract_tex_meta "$PREPRINT_SEND_FILE" "msc")"
-            [[ -z "$PREPRINT_SEND_KEYWORDS" ]] && PREPRINT_SEND_KEYWORDS="$(__preprint_extract_tex_meta "$PREPRINT_SEND_FILE" "keywords")"
+            [[ -z "$PREPRINT_SEND_TITLE" ]]        && PREPRINT_SEND_TITLE="$(__preprint_extract_tex_meta "$PREPRINT_SEND_FILE" "title")"
+            [[ -z "$PREPRINT_SEND_AUTHOR" ]]       && PREPRINT_SEND_AUTHOR="$(__preprint_extract_tex_meta "$PREPRINT_SEND_FILE" "author")"
+            [[ -z "$PREPRINT_SEND_AFFILIATIONS" ]] && PREPRINT_SEND_AFFILIATIONS="$(__preprint_extract_tex_meta "$PREPRINT_SEND_FILE" "affiliation")"
+            [[ -z "$PREPRINT_SEND_EMAILS" ]]       && PREPRINT_SEND_EMAILS="$(__preprint_extract_tex_meta "$PREPRINT_SEND_FILE" "email")"
+            [[ -z "$PREPRINT_SEND_ABSTRACT" ]]     && PREPRINT_SEND_ABSTRACT="$(__preprint_extract_tex_meta "$PREPRINT_SEND_FILE" "abstract")"
+            [[ -z "$PREPRINT_SEND_MSC" ]]          && PREPRINT_SEND_MSC="$(__preprint_extract_tex_meta "$PREPRINT_SEND_FILE" "msc")"
+            [[ -z "$PREPRINT_SEND_KEYWORDS" ]]     && PREPRINT_SEND_KEYWORDS="$(__preprint_extract_tex_meta "$PREPRINT_SEND_FILE" "keywords")"
         fi
 
         # 4. GLOBAL METADATA VALIDATION: Block sending for ALL providers if title, author, abstract (or required category) is missing!
@@ -1340,6 +1353,11 @@ EOF
             file_info="${PREPRINT_SEND_FILE} (${fbytes} bytes)"
         fi
 
+        local -a auth_arr=() aff_arr=() em_arr=()
+        IFS=';' read -ra auth_arr <<< "$PREPRINT_SEND_AUTHOR"
+        IFS=';' read -ra aff_arr  <<< "$PREPRINT_SEND_AFFILIATIONS"
+        IFS=';' read -ra em_arr   <<< "$PREPRINT_SEND_EMAILS"
+
         echo "========================================================================"
         echo "                 PREPRINT SUBMISSION CONFIRMATION"
         echo "========================================================================"
@@ -1347,7 +1365,29 @@ EOF
         printf "  %-13s %s\n" "Target File:" "$file_info"
         [[ -n "$PREPRINT_SEND_META" ]]     && printf "  %-13s %s\n" "Meta File:" "$PREPRINT_SEND_META"
         printf "  %-13s %s\n" "Title:" "${PREPRINT_SEND_TITLE:--}"
-        printf "  %-13s %s\n" "Authors:" "${PREPRINT_SEND_AUTHOR:--}"
+        if (( ${#auth_arr[@]} == 0 )); then
+            printf "  %-13s %s\n" "Authors:" "-"
+        else
+            local idx a_name a_aff a_em a_line
+            for (( idx=0; idx<${#auth_arr[@]}; idx++ )); do
+                a_name="${auth_arr[$idx]#"${auth_arr[$idx]%%[![:space:]]*}"}"
+                a_name="${a_name%"${a_name##*[![:space:]]}"}"
+                a_aff="${aff_arr[$idx]:-}"
+                a_aff="${a_aff#"${a_aff%%[![:space:]]*}"}"
+                a_aff="${a_aff%"${a_aff##*[![:space:]]}"}"
+                a_em="${em_arr[$idx]:-}"
+                a_em="${a_em#"${a_em%%[![:space:]]*}"}"
+                a_em="${a_em%"${a_em##*[![:space:]]}"}"
+                a_line="$a_name"
+                [[ -n "$a_aff" ]] && a_line+=" (${a_aff})"
+                [[ -n "$a_em" ]]  && a_line+=" <${a_em}>"
+                if (( idx == 0 )); then
+                    printf "  %-13s %s\n" "Authors:" "$a_line"
+                else
+                    printf "  %-13s %s\n" "" "$a_line"
+                fi
+            done
+        fi
         printf "  %-13s %s\n" "Category:" "${PREPRINT_SEND_CATEGORY:--}"
         [[ -n "$PREPRINT_SEND_MSC" ]]      && printf "  %-13s %s\n" "MSC (2020):" "$PREPRINT_SEND_MSC"
         [[ -n "$PREPRINT_SEND_KEYWORDS" ]] && printf "  %-13s %s\n" "Keywords:" "$PREPRINT_SEND_KEYWORDS"
