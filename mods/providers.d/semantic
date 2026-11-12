@@ -1,13 +1,13 @@
 #! /bin/bash
 
-__s2__() {
-    __preprint_register_provider "s2" \
+__semantic__() {
+    __preprint_register_provider "semantic" \
         --aliases "semanticscholar,semantic-scholar,semantic" \
         --pagination "offset" \
         --requires-file "false" \
         --desc "Semantic Scholar Academic Graph API (search, author profile works, OA PDFs)"
 
-    __preprint_parse_s2_json() {
+    __preprint_parse_semantic_json() {
         local mode="${1:-compact}"
         LC_ALL=C awk -v mode="$mode" '
             function unesc(s) {
@@ -125,43 +125,43 @@ __s2__() {
         '
     }
 
-    __preprint_provider_s2_list() {
+    __preprint_provider_semantic_list() {
         local max="${1:-0}" sort_by="${2:-time}" reverse="${3:-0}"
         local limit=$(( max > 0 && max <= 1000 ? max : 200 ))
-        local profile="${S2_PROFILE:-$(__preprint_get_conf s2 profile)}"
-        [[ -z "$profile" ]] && profile="$(__preprint_get_conf s2 author)"
-        local token="${S2_TOKEN:-$(__preprint_get_conf s2 token)}"
+        local profile="${SEMANTIC_PROFILE:-$(__preprint_get_conf semantic profile)}"
+        [[ -z "$profile" ]] && profile="$(__preprint_get_conf semantic author)"
+        local token="${SEMANTIC_TOKEN:-$(__preprint_get_conf semantic token)}"
 
         if [[ -z "$profile" ]]; then
             __log "Set your Semantic Scholar Author ID first:
-  preprint database set -d s2 --profile <author_id>" -t error -l preprint
+  preprint database set -d semantic --profile <author_id>" -t error -l preprint
             return 1
         fi
 
         local -a auth_hdr=()
         [[ -n "$token" ]] && auth_hdr=(-H "x-api-key: $token")
         local fields="paperId,title,year,publicationDate,authors"
-        curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/author/${profile}/papers?fields=${fields}&limit=${limit}" 2>/dev/null | __preprint_parse_s2_json "compact" || echo "No entries found in Semantic Scholar."
+        curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/author/${profile}/papers?fields=${fields}&limit=${limit}" 2>/dev/null | __preprint_parse_semantic_json "compact" || echo "No entries found in Semantic Scholar."
     }
 
-    __preprint_provider_s2_get() {
+    __preprint_provider_semantic_get() {
         local id="$1"
         if [[ "$id" == W* || "$id" == https://openalex.org/* ]]; then
             __preprint_provider_openalex_get "$id"
             return $?
         fi
-        local token="${S2_TOKEN:-$(__preprint_get_conf s2 token)}"
+        local token="${SEMANTIC_TOKEN:-$(__preprint_get_conf semantic token)}"
         local -a auth_hdr=()
         [[ -n "$token" ]] && auth_hdr=(-H "x-api-key: $token")
         local fields="paperId,title,abstract,year,publicationDate,venue,citationCount,authors,url,openAccessPdf,externalIds"
-        curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/paper/$(__preprint_urlencode "$id")?fields=${fields}" 2>/dev/null | __preprint_parse_s2_json "detailed" || echo "No entry found in Semantic Scholar for '$id'."
+        curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/paper/$(__preprint_urlencode "$id")?fields=${fields}" 2>/dev/null | __preprint_parse_semantic_json "detailed" || echo "No entry found in Semantic Scholar for '$id'."
     }
 
-    __preprint_provider_s2_search() {
+    __preprint_provider_semantic_search() {
         local term="$1" limit="${2:-25}" offset="${3:-0}" sort_by="${4:-time}" reverse="${5:-0}"
         (( limit > 100 )) && limit=100
         local enc_term=$(__preprint_urlencode "$term")
-        local token="${S2_TOKEN:-$(__preprint_get_conf s2 token)}"
+        local token="${SEMANTIC_TOKEN:-$(__preprint_get_conf semantic token)}"
         local -a auth_hdr=()
         [[ -n "$token" ]] && auth_hdr=(-H "x-api-key: $token")
 
@@ -170,21 +170,21 @@ __s2__() {
 
         # 1. Primary Graph API search
         resp=$(curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/paper/search?query=${enc_term}&offset=${offset}&limit=${limit}&fields=${fields}" 2>/dev/null)
-        [[ -n "$resp" ]] && out=$(__preprint_parse_s2_json "compact" <<< "$resp" 2>/dev/null)
+        [[ -n "$resp" ]] && out=$(__preprint_parse_semantic_json "compact" <<< "$resp" 2>/dev/null)
 
-        # 2. Bulk Search API fallback (separate rate-limit bucket on S2)
+        # 2. Bulk Search API fallback (separate rate-limit bucket on SEMANTIC)
         if [[ -z "$out" ]]; then
             resp=$(curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/paper/search/bulk?query=${enc_term}&fields=${fields}" 2>/dev/null)
-            [[ -n "$resp" ]] && out=$(__preprint_parse_s2_json "compact" <<< "$resp" 2>/dev/null | head -n "$limit")
+            [[ -n "$resp" ]] && out=$(__preprint_parse_semantic_json "compact" <<< "$resp" 2>/dev/null | head -n "$limit")
         fi
 
         # 3. Autocomplete endpoint fallback (rarely rate-limited)
         if [[ -z "$out" ]]; then
             resp=$(curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/paper/autocomplete?query=${enc_term}" 2>/dev/null)
-            [[ -n "$resp" ]] && out=$(__preprint_parse_s2_json "compact" <<< "$resp" 2>/dev/null)
+            [[ -n "$resp" ]] && out=$(__preprint_parse_semantic_json "compact" <<< "$resp" 2>/dev/null)
         fi
 
-        # 4. OpenAlex fallback if S2 public anonymous pool returns HTTP 429 Too Many Requests
+        # 4. OpenAlex fallback if SEMANTIC public anonymous pool returns HTTP 429 Too Many Requests
         if [[ -z "$out" ]]; then
             local page=$(( (offset / (limit > 0 ? limit : 25)) + 1 ))
             out=$(__preprint_provider_openalex_search "$term" "$limit" "$page" "$sort_by" "$reverse" 2>/dev/null)
@@ -197,27 +197,27 @@ __s2__() {
         fi
     }
 
-    __preprint_provider_s2_download() {
+    __preprint_provider_semantic_download() {
         local id="$1" out_path="${2:-}"
         if [[ "$id" == W* || "$id" == https://openalex.org/* ]]; then
             __preprint_provider_openalex_download "$id" "$out_path"
             return $?
         fi
-        local token="${S2_TOKEN:-$(__preprint_get_conf s2 token)}"
+        local token="${SEMANTIC_TOKEN:-$(__preprint_get_conf semantic token)}"
         local -a auth_hdr=()
         [[ -n "$token" ]] && auth_hdr=(-H "x-api-key: $token")
         local json pdf_url arx_id doi_id
         json=$(curl -fsSL "${auth_hdr[@]}" "https://api.semanticscholar.org/graph/v1/paper/$(__preprint_urlencode "$id")?fields=openAccessPdf,externalIds" 2>/dev/null)
-        read -r pdf_url arx_id doi_id < <(__preprint_parse_s2_json "pdf" <<< "$json")
+        read -r pdf_url arx_id doi_id < <(__preprint_parse_semantic_json "pdf" <<< "$json")
 
         if [[ -n "$pdf_url" && "$pdf_url" != "-" ]]; then
-            __preprint_save_pdf_stream "$pdf_url" "s2_${id//\//_}.pdf" "$out_path"
+            __preprint_save_pdf_stream "$pdf_url" "semantic_${id//\//_}.pdf" "$out_path"
             return $?
         elif [[ -n "$arx_id" && "$arx_id" != "-" ]]; then
             __preprint_download_entry "arxiv" "$arx_id" "$out_path"
             return $?
         elif [[ -n "$doi_id" && "$doi_id" != "-" ]]; then
-            __preprint_resolve_doi_pdf "$doi_id" "$out_path" "s2_${id//\//_}.pdf"
+            __preprint_resolve_doi_pdf "$doi_id" "$out_path" "semantic_${id//\//_}.pdf"
             return $?
         fi
         __log "No Open-Access PDF available for Semantic Scholar paper '$id'." -t error -l preprint
