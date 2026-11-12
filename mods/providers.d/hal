@@ -4,6 +4,7 @@ __hal__() {
     __preprint_register_provider "hal" \
         --pagination "offset" \
         --requires-file "false" \
+        --requires-category "true" \
         --desc "HAL Open Archive (stage drafts via send, finalize via publish)"
 
     __preprint_hal_sword_url() {
@@ -43,7 +44,6 @@ __hal__() {
                     count++
                     if (hid == "") hid = "N/A"
                     if (title == "") title = "Untitled"
-
                     date = pdate
                     if (date == "") date = pubdate
                     if (date == "") date = substr(subdate, 1, 10)
@@ -52,7 +52,6 @@ __hal__() {
                     if (date == "") date = "N/A"
                     if (length(date) == 4 && date ~ /^[0-9]{4}$/) date = date "-01-01"
                     if (length(date) == 7 && date ~ /^[0-9]{4}-[0-9]{2}$/) date = date "-01"
-
                     if (authors == "") authors = "Unknown Author"
                     if (pdf == "" && ffirst != "") pdf = ffirst
                     if (pdf == "" && arx != "") pdf = "https://arxiv.org/pdf/" arx ".pdf (via arXiv)"
@@ -91,7 +90,6 @@ __hal__() {
                     val = $0
                     sub(/<\/(str|date|int)$/, "", val)
                     val = unesc_xml(val)
-
                     if (cur_field == "halId_s")                  hid = val
                     else if (cur_field == "producedDate_s")      pdate = val
                     else if (cur_field == "publicationDate_s")   pubdate = val
@@ -107,7 +105,6 @@ __hal__() {
                     else if (cur_field == "title_s")             { if (title == "") title = val }
                     else if (cur_field == "abstract_s")          { if (abstract == "") abstract = val }
                     else if (cur_field == "authFullName_s")      { if (val != "") authors = (authors == "" ? val : authors ", " val) }
-
                     cur_field = ""
                 }
             }
@@ -162,7 +159,7 @@ __hal__() {
             pdf_url=$(LC_ALL=C awk '
                 /citation_pdf_url/ {
                     if (match($0, /content="https?:\/\/[^"]+"/)) {
-                        u = substr(0, RSTART + 9, RLENGTH - 10)
+                        u = substr($0, RSTART + 9, RLENGTH - 10)
                         print u; exit
                     }
                 }
@@ -172,7 +169,6 @@ __hal__() {
                 }
                 END { if (fallback != "") print fallback }
             ' <<< "$page_html")
-
             if [[ -z "$pdf_url" ]]; then
                 __log "No PDF file is publicly available for HAL entry '$base_id'." -t error -l preprint
                 return 1
@@ -207,9 +203,9 @@ __hal__() {
                 return 0
             fi
             __log "Set your HAL profile ID (idHAL) or ORCID iD first:
-  preprint database set -d hal --profile <idhal>
+  preprint conf set hal --profile <idhal>
   OR
-  preprint database set -d hal --orcid <0000-0000-0000-0000>" -t error -l preprint
+  preprint conf set hal --orcid <0000-0000-0000-0000>" -t error -l preprint
             return 1
         fi
 
@@ -228,7 +224,6 @@ __hal__() {
                 "$d_id" "$d_title" "$d_date" "$d_authors" "$d_pkg" "$d_extra"
             return 0
         fi
-
         local base_id="$id"
         if [[ "$base_id" =~ ^(.+)v[0-9]+$ ]]; then
             base_id="${BASH_REMATCH[1]}"
@@ -249,7 +244,7 @@ __hal__() {
     # Stages a deposit in HAL as a DRAFT (In-Progress: true) and caches package for 'preprint publish'
     __preprint_provider_hal_send() {
         local file="$PREPRINT_SEND_FILE" meta="$PREPRINT_SEND_META" title="$PREPRINT_SEND_TITLE"
-        local author="$PREPRINT_SEND_AUTHOR" abstract="$PREPRINT_SEND_ABSTRACT" category="${PREPRINT_SEND_CATEGORY:-info}"
+        local author="$PREPRINT_SEND_AUTHOR" abstract="$PREPRINT_SEND_ABSTRACT" category="$PREPRINT_SEND_CATEGORY"
         local doi="$PREPRINT_SEND_DOI" pub_date="$PREPRINT_SEND_DATE"
         local work_type="${PREPRINT_SEND_TYPE:-preprint}"
 
@@ -268,7 +263,7 @@ __hal__() {
         elif [[ -n "$user" && -n "$pass" ]]; then
             auth_args=(-u "${user}:${pass}")
         else
-            __log "HAL credentials missing. Run: preprint database set -d hal --user <user> --pass <pass>" -t error -l preprint
+            __log "HAL credentials missing. Run: preprint conf set hal --user <user> --pass <pass>" -t error -l preprint
             return 1
         fi
 
@@ -283,10 +278,6 @@ __hal__() {
         esac
 
         [[ -z "$pub_date" ]] && printf -v pub_date "%(%Y-%m-%d)T" -1
-        [[ -z "$title" && -n "$file" ]] && title="$(basename "${file%.*}")"
-        [[ -z "$title" ]] && { __log "HAL deposit requires a title (-t/--title)." -t error -l preprint; return 1; }
-        [[ -z "$author" ]] && author="${USER:-Anonymous}"
-        [[ -z "$abstract" ]] && abstract="Preprint uploaded via omni preprint tool."
 
         local esc_title esc_abs esc_dom esc_date authors_xml="" idno_xml="" edition_ref=""
         esc_title=$(__preprint_xml_escape "$title")
@@ -404,7 +395,6 @@ EOF
 
         http_code="${resp##*$'\n'}"
         local body="${resp%$'\n'*}"
-
         if [[ "$http_code" =~ ^20[012]$ ]]; then
             local hal_id edit_iri
             hal_id=$(LC_ALL=C awk 'match($0, /<id>[^<]+<\/id>/) { s = substr($0, RSTART + 4, RLENGTH - 9); print s; exit }' <<< "$body")
@@ -472,6 +462,7 @@ EOF
                 --data-binary @"$cached_pkg" \
                 "$edit_iri" 2>&1)
             http_code="${resp##*$'\n'}"
+
             if [[ ! "$http_code" =~ ^20[0124]$ ]]; then
                 resp=$(curl -sS -w "\n%{http_code}" -X POST "${auth_args[@]}" \
                     -H "Content-Type: ${content_type}" \
@@ -508,6 +499,7 @@ EOF
     __preprint_provider_hal_rm() {
         local id="$1"
         [[ -z "$id" ]] && { __log "HAL ID required to remove deposit." -t error -l preprint; return 1; }
+
         local user pass token sword_url auth_args=()
         user="${HAL_USER:-$(__preprint_get_conf hal user)}"
         pass="${HAL_PASS:-$(__preprint_get_conf hal pass)}"

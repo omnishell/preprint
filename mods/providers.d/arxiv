@@ -4,6 +4,7 @@ __arxiv__() {
     __preprint_register_provider "arxiv" \
         --pagination "offset" \
         --requires-file "true" \
+        --requires-category "true" \
         --desc "arXiv.org e-Print archive (Atom API & SWORD deposit)"
 
     __preprint_parse_arxiv_atom() {
@@ -34,7 +35,6 @@ __arxiv__() {
                 date_val = (pub != "" ? pub : upd)
                 pub_short = (date_val != "" ? substr(date_val, 1, 10) : "N/A")
                 if (authors == "") authors = "Unknown Author"
-
                 if (mode == "detailed") {
                     printf "ID:        %s\nTitle:     %s\nPublished: %s\nAuthors:   %s\nURL:       https://arxiv.org/abs/%s\nPDF:       https://arxiv.org/pdf/%s.pdf\nAbstract:\n  %s\n", id, title, pub_short, authors, id, id, summary
                 } else {
@@ -191,7 +191,7 @@ __arxiv__() {
                 }
             ' <<< "$dashboard_html")
             if [[ -n "$detected_pid" ]]; then
-                __preprint_database set -d arxiv --profile "$detected_pid" >/dev/null 2>&1
+                __preprint_conf set -d arxiv --profile "$detected_pid" >/dev/null 2>&1
                 local feed
                 feed=$(curl -fsSL "https://arxiv.org/a/${detected_pid}.atom2" 2>/dev/null)
                 if [[ "$feed" == *"<entry>"* ]]; then
@@ -224,7 +224,10 @@ __arxiv__() {
             fi
         fi
 
-        __log "Could not resolve arXiv profile entries. Set your arXiv Author ID or ORCID iD via:   preprint database set -d arxiv --profile <author_id>   OR   preprint database set -d arxiv --orcid <0000-0000-0000-0000>" -t error -l preprint
+        __log "Could not resolve arXiv profile entries. Set your arXiv Author ID or ORCID iD via:
+  preprint conf set arxiv --profile <author_id>
+  OR
+  preprint conf set arxiv --orcid <0000-0000-0000-0000>" -t error -l preprint
         return 1
     }
 
@@ -260,7 +263,7 @@ __arxiv__() {
 
     __preprint_provider_arxiv_send() {
         local file="$PREPRINT_SEND_FILE" meta="$PREPRINT_SEND_META" title="$PREPRINT_SEND_TITLE"
-        local author="$PREPRINT_SEND_AUTHOR" abstract="$PREPRINT_SEND_ABSTRACT" category="${PREPRINT_SEND_CATEGORY:-cs.AI}"
+        local author="$PREPRINT_SEND_AUTHOR" abstract="$PREPRINT_SEND_ABSTRACT" category="$PREPRINT_SEND_CATEGORY"
         local user pass token
         user="${ARXIV_USER:-$(__preprint_get_conf arxiv user)}"
         pass="${ARXIV_PASS:-$(__preprint_get_conf arxiv pass)}"
@@ -272,7 +275,7 @@ __arxiv__() {
         elif [[ -n "$user" && -n "$pass" ]]; then
             auth_args=(-u "${user}:${pass}")
         else
-            __log "arXiv credentials missing. Run: preprint database set -d arxiv --user <user> --pass <pass> (or --token <token>)" -t error -l preprint
+            __log "arXiv credentials missing. Run: preprint conf set arxiv --user <user> --pass <pass> (or --token <token>)" -t error -l preprint
             return 1
         fi
 
@@ -280,11 +283,8 @@ __arxiv__() {
         if [[ "$file" != *.zip ]]; then
             tmp_dir="$(mktemp -d)"
             upload_zip="$tmp_dir/arxiv_submission.zip"
-            [[ -z "$title" ]] && title="$(basename "${file%.*}")"
-            [[ -z "$author" ]] && author="${USER:-Anonymous}"
-            [[ -z "$abstract" ]] && abstract="Preprint submitted via omni preprint."
 
-            if [[ -n "$meta" && -f "$meta" ]]; then
+            if __preprint_is_raw_payload_meta "$meta"; then
                 cp "$meta" "$tmp_dir/atom.xml"
             else
                 local esc_title esc_abs esc_cat authors_xml=""
@@ -321,8 +321,8 @@ EOF
             -H "Packaging: http://purl.org/net/sword/package/SimpleZip" \
             --data-binary @"$upload_zip" \
             "https://arxiv.org/sword-app/deposit" 2>&1)
-        [[ -n "$tmp_dir" ]] && rm -rf "$tmp_dir"
 
+        [[ -n "$tmp_dir" ]] && rm -rf "$tmp_dir"
         http_code="${resp##*$'\n'}"
         local body="${resp%$'\n'*}"
         if [[ "$http_code" =~ ^20[012]$ ]]; then

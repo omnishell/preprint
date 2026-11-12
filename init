@@ -56,16 +56,19 @@ OPTIONS (for 'conf set'):
 METADATA OPTIONS (for 'send'):
     -d, --database <prov>   Target provider (${dbs_csv})
     -m, --meta <file>       Custom metadata file (YAML/Key-Value, JSON, or XML)
-    -t, --title <title>     Title of the paper/work
-    -a, --author <authors>  Authors separated by ';' (e.g., "John Doe; Jane Smith")
-    -A, --abstract <text>   Abstract or short description
-    -c, --category <cat>    Domain/Category (e.g., "math.NT", "cs.AI", "info.info-ai")
+    -t, --title <title>     Title of the paper/work (auto-extracted if <file> is .tex)
+    -a, --author <authors>  Authors separated by ';' (auto-extracted if <file> is .tex)
+    -A, --abstract <text>   Abstract or short description (auto-extracted if <file> is .tex)
+    -c, --category <cat>    Domain/Category (e.g., "math-ph", "math.DG", "cs.AI", "info.info-ai")
+    --msc <codes>           MSC2020 codes separated by ',' or ';' (auto-extracted from \subjclass in .tex)
+    --keywords <list>       Keywords separated by ';' (auto-extracted from \keywords in .tex)
     --doi <doi>             DOI identifier (e.g., "10.1234/example.2026")
-    --id <provider:id>      External identifier (repeatable, e.g., --id arxiv:2301.00001 --id hexagon:2610.00244v1)
+    --id <provider:id>      External identifier (repeatable, e.g., --id arxiv:2301.00001)
     --url <url>             Work URL
     --journal <name>        Journal or host venue title
     --type <type>           Work type (default: "preprint"; e.g., "journal-article")
     --date <YYYY[-MM[-DD]]> Publication date (default: today)
+    -y, --yes               Skip interactive confirmation screen before sending
 EOF
     }
 
@@ -103,7 +106,6 @@ EOF
                 __preprint_rm "$@"
                 ;;
             profile)
-                # Legacy alias routing to conf or entry commands
                 __preprint_profile_legacy "$@"
                 ;;
             *)
@@ -119,7 +121,7 @@ EOF
         local cmd="${COMP_WORDS[1]:-}"
         local subcmd="${COMP_WORDS[2]:-}"
         local dbs="${PREPRINT_PROVIDERS[*]}"
-        local meta_flags="-d --database -m --meta -t --title -a --author -A --abstract -c --category --doi --id --url --journal --type --date"
+        local meta_flags="-d --database -m --meta -t --title -a --author -A --abstract -c --category --msc --keywords --doi --id --url --journal --type --date -y --yes"
 
         if [[ $COMP_CWORD -eq 1 ]]; then
             COMPREPLY=( $(compgen -W "conf ls search get download send publish rm --help -h" -- "$cur") )
