@@ -9,6 +9,12 @@ __helper__() {
     declare -gA PREPRINT_PROVIDER_ALIASES=()
     declare -gA PREPRINT_PROVIDER_META=()
 
+    # Register a preprint provider plugin:
+    #   __preprint_register_provider <name> \
+    #       [--aliases "a1,a2"] \
+    #       [--pagination "offset|page"] \
+    #       [--requires-file "true|false"] \
+    #       [--desc "Description"]
     __preprint_register_provider() {
         local name="${1,,}"; shift || true
         [[ -z "$name" ]] && return 1
@@ -86,6 +92,8 @@ __helper__() {
         return 0
     }
 
+    # Invoke an internal provider method: __preprint_call <provider> <method> [args...]
+    # Dispatches to: __preprint_provider_<provider>_<method>
     __preprint_call() {
         local db="$(__preprint_norm_db "$1")" method="$2"
         shift 2
@@ -194,7 +202,6 @@ __helper__() {
                     clean_id = id; sub(/^hexagon:/, "", clean_id)
                     seen_remote[clean_id] = 1
                     if ((clean_id in draft_line) && $0 !~ /\[DRAFT\]/) {
-                        # Inject [DRAFT] marker after (date)
                         line = $0
                         if (match(line, /^\[[^\]]+\][ \t]*\([^)]*\)[ \t]*/)) {
                             prefix = substr(line, 1, RLENGTH)
@@ -269,6 +276,46 @@ __helper__() {
         return 1
     }
 
+    # Check whether a provider profile has been configured in PREPRINT_CONF or via ENV
+    __preprint_is_profile_registered() {
+        local db="$(__preprint_norm_db "$1")"
+        __preprint_load_omnirc
+
+        local conf="${PREPRINT_CONF[$db]:-}"
+        if [[ -n "$conf" ]]; then
+            local -a pairs=()
+            IFS=',' read -ra pairs <<< "$conf"
+            local pair k v
+            for pair in "${pairs[@]}"; do
+                k="${pair%%:*}"
+                v="${pair#*:}"
+                if [[ "$k" != "sandbox" && -n "$v" ]]; then
+                    return 0
+                fi
+            done
+        fi
+
+        # Check environment variable overrides
+        local up="${db^^}"
+        local env_p="${up}_PROFILE" env_o="${up}_ORCID" env_t="${up}_TOKEN" env_u="${up}_USER"
+        if [[ -n "${!env_p:-}" || -n "${!env_o:-}" || -n "${!env_t:-}" || -n "${!env_u:-}" ]]; then
+            return 0
+        fi
+        [[ "$db" == "orcid" && -n "${ORCID_ID:-}" ]] && return 0
+
+        return 1
+    }
+
+    __preprint_require_registered_profile() {
+        local db="$(__preprint_norm_db "$1")"
+        __preprint_require_provider "$db" || return 1
+        if ! __preprint_is_profile_registered "$db"; then
+            __log "profile not registered" -t error -l preprint
+            return 1
+        fi
+        return 0
+    }
+
     __preprint_load_kv_meta() {
         local mfile="$1"
         [[ -z "$mfile" || ! -f "$mfile" ]] && return 0
@@ -312,6 +359,7 @@ __helper__() {
         [[ "$first_char" == "{" || "$first_char" == "[" || "$first_char" == "<" ]]
     }
 
+    # Pure Bash RFC 3986 URL encoder
     __preprint_urlencode() {
         local LC_ALL=C
         local str="$1" i c out="" hex
@@ -325,6 +373,7 @@ __helper__() {
         printf '%s' "$out"
     }
 
+    # Pure Bash JSON string escaper
     __preprint_json_escape() {
         local s="$1"
         s="${s//\\/\\\\}"
@@ -335,6 +384,7 @@ __helper__() {
         printf '%s' "$s"
     }
 
+    # Pure Bash XML string escaper
     __preprint_xml_escape() {
         local s="$1"
         s="${s//&/&amp;}"
@@ -345,6 +395,7 @@ __helper__() {
         printf '%s' "$s"
     }
 
+    # Normalize sort criteria ('time' or 'alpha')
     __preprint_norm_sort() {
         local s="${1,,}"
         case "$s" in
@@ -505,7 +556,7 @@ __helper__() {
         fi
 
         local db="$(__preprint_norm_db "$raw_db")"
-        __preprint_require_provider "$db" || return 1
+        __preprint_require_registered_profile "$db" || return 1
 
         local profile orcid user pass token sandbox
         profile="$(__preprint_get_conf "$db" profile)"
@@ -517,11 +568,8 @@ __helper__() {
         sandbox="$(__preprint_get_conf "$db" sandbox)"
         [[ -z "$sandbox" ]] && sandbox="false"
 
-        local status="unconfigured"
-        [[ -n "${PREPRINT_CONF[$db]:-}" ]] && status="registered"
-
         printf "Provider:  %s\n" "$db"
-        printf "Status:    %s\n" "$status"
+        printf "Status:    registered\n"
         printf "Profile:   %s\n" "${profile:--}"
         printf "ORCID:     %s\n" "${orcid:--}"
         printf "User:      %s\n" "${user:--}"
@@ -650,15 +698,18 @@ __helper__() {
             esac
         done
 
+        # If no provider was specified (e.g. 'preprint profile ls'), show registration status table
         if [[ -z "$db" ]]; then
-            __log "Usage: preprint profile list <provider> [-s/--sort <time|alpha>] [-r/--reverse] [-n/--max <N>]" -t error -l preprint
-            return 1
+            __preprint_database ls
+            return $?
         fi
-        __preprint_require_provider "$db" || return 1
+
+        # Verify provider is valid and profile is registered
+        __preprint_require_registered_profile "$db" || return 1
 
         sort_by="$(__preprint_norm_sort "$sort_by")"
         local raw_out=""
-        raw_out="$(__preprint_call "$db" list "$max" "$sort_by" "$reverse" 2>/dev/null)" || true
+        raw_out="$(__preprint_call "$db" list "$max" "$sort_by" "$reverse")" || return 1
         raw_out="$(__preprint_merge_profile_drafts "$db" "$raw_out")"
 
         if [[ -z "$raw_out" || "$raw_out" == "No "* ]]; then
@@ -715,7 +766,7 @@ __helper__() {
             __log "Usage: preprint profile rm <provider> [<entry_id>]" -t error -l preprint
             return 1
         fi
-        __preprint_require_provider "$db" || return 1
+        __preprint_require_registered_profile "$db" || return 1
 
         if [[ -z "$entry_id" ]]; then
             if ! command -v fzf >/dev/null 2>&1; then
@@ -785,13 +836,13 @@ EOF
 
         case "$action" in
             ls|list)
-                printf "%-14s %-14s %s\n" "PROVIDER" "STATUS" "CONFIGURED KEYS"
-                printf "%-14s %-14s %s\n" "--------" "------" "---------------"
+                printf "%-14s %-18s %s\n" "PROVIDER" "STATUS" "CONFIGURED KEYS"
+                printf "%-14s %-18s %s\n" "--------" "------" "---------------"
                 local db pair k v
                 for db in "${PREPRINT_PROVIDERS[@]}"; do
-                    if [[ -n "${PREPRINT_CONF[$db]:-}" ]]; then
+                    if __preprint_is_profile_registered "$db"; then
                         local -a keys=() pairs=()
-                        IFS=',' read -ra pairs <<< "${PREPRINT_CONF[$db]}"
+                        IFS=',' read -ra pairs <<< "${PREPRINT_CONF[$db]:-}"
                         for pair in "${pairs[@]}"; do
                             k="${pair%%:*}"
                             v="${pair#*:}"
@@ -803,9 +854,9 @@ EOF
                                 keys+=("${k}:${v}")
                             fi
                         done
-                        printf "%-14s %-14s %s\n" "$db" "registered" "${keys[*]}"
+                        printf "%-14s %-18s %s\n" "$db" "registered" "${keys[*]:-(via env)}"
                     else
-                        printf "%-14s %-14s %s\n" "$db" "unconfigured" "-"
+                        printf "%-14s %-18s %s\n" "$db" "not registered" "-"
                     fi
                 done
                 ;;
@@ -866,6 +917,7 @@ EOF
         __preprint_require_provider "$db" || return 1
 
         if [[ -z "$target" ]]; then
+            __preprint_require_registered_profile "$db" || return 1
             if ! command -v fzf >/dev/null 2>&1; then
                 __log "missing 'fzf' for interactive selection (pass <id> or install fzf)." -t error -l preprint
                 return 1
@@ -1088,7 +1140,7 @@ EOF
             __log "Target provider required (-d/--database <$(__preprint_providers_csv)>)." -t error -l preprint
             return 1
         }
-        __preprint_require_provider "$db" || return 1
+        __preprint_require_registered_profile "$db" || return 1
 
         if [[ -n "$PREPRINT_SEND_META" && -f "$PREPRINT_SEND_META" ]]; then
             __preprint_load_kv_meta "$PREPRINT_SEND_META"
@@ -1137,7 +1189,7 @@ EOF
             __log "Usage: preprint publish [<id>] -d/--database <provider>" -t error -l preprint
             return 1
         fi
-        __preprint_require_provider "$db" || return 1
+        __preprint_require_registered_profile "$db" || return 1
 
         if ! declare -f "__preprint_provider_${db}_publish" >/dev/null 2>&1; then
             __log "Provider '$db' does not support staged draft publishing." -t error -l preprint
@@ -1168,7 +1220,7 @@ EOF
                 target="${selected%% *}"
             fi
         else
-            # Verify that the specified <id> is actually in draft state (either in profile list [DRAFT] or local draft store)
+            # Verify that the specified <id> is actually in draft state
             local clean_target="${target#hexagon:}"
             local is_listed_published=0 is_listed_draft=0
             if [[ -n "$all_entries" ]]; then
