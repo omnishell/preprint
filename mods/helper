@@ -1371,7 +1371,9 @@ EOF
                 --date)           PREPRINT_SEND_DATE="$2"; shift 2 ;;
                 --date=*)         PREPRINT_SEND_DATE="${1#*=}"; shift ;;
                 --id)
-                    if [[ "$2" == *:* ]]; then
+                    if (( is_update == 1 )) && [[ -z "$PREPRINT_SEND_UPDATE_ID" && "$2" != *":"* ]]; then
+                        PREPRINT_SEND_UPDATE_ID="$2"
+                    elif [[ "$2" == *:* ]]; then
                         local k="$(__preprint_norm_db "${2%%:*}")"
                         PREPRINT_SEND_EXT_IDS["$k"]="${2#*:}"
                     fi
@@ -1379,7 +1381,9 @@ EOF
                     ;;
                 --id=*)
                     local kv="${1#*=}"
-                    if [[ "$kv" == *:* ]]; then
+                    if (( is_update == 1 )) && [[ -z "$PREPRINT_SEND_UPDATE_ID" && "$kv" != *":"* ]]; then
+                        PREPRINT_SEND_UPDATE_ID="$kv"
+                    elif [[ "$kv" == *:* ]]; then
                         local k="$(__preprint_norm_db "${kv%%:*}")"
                         PREPRINT_SEND_EXT_IDS["$k"]="${kv#*:}"
                     fi
@@ -1407,10 +1411,9 @@ EOF
         }
         __preprint_require_registered_profile "$db" || return 1
 
-        # If -u/--update was passed without an ID, let user select an existing paper via fzf
         if (( is_update == 1 )) && [[ -z "$PREPRINT_SEND_UPDATE_ID" ]]; then
             if ! command -v fzf >/dev/null 2>&1; then
-                __log "Pass <id> to -u/--update or install 'fzf' to select a paper interactively." -t error -l preprint
+                __log "Pass --id <existing_id> (or <id>) to update, or install 'fzf' to select interactively." -t error -l preprint
                 return 1
             fi
             local existing_entries sel_update
@@ -1428,12 +1431,10 @@ EOF
             fi
         fi
 
-        # 1. Load key:value pairs from -m <meta_file> if supplied
         if [[ -n "$PREPRINT_SEND_META" && -f "$PREPRINT_SEND_META" ]]; then
             __preprint_load_kv_meta "$PREPRINT_SEND_META"
         fi
 
-        # 2. Verify target file existence if required by provider
         local req_file="${PREPRINT_PROVIDER_META["${db}:requires_file"]:-true}"
         if [[ "$req_file" == "true" && -z "$PREPRINT_SEND_FILE" ]]; then
             __log "Usage: preprint paper send <file> [options] -d/--database $db" -t error -l preprint
@@ -1444,7 +1445,6 @@ EOF
             return 1
         fi
 
-        # 3. Auto-extract metadata from .tex file (or main .tex inside directory!)
         local tex_source=""
         if [[ -n "$PREPRINT_SEND_FILE" && "$PREPRINT_SEND_FILE" == *.tex && -f "$PREPRINT_SEND_FILE" ]]; then
             tex_source="$PREPRINT_SEND_FILE"
@@ -1462,12 +1462,10 @@ EOF
             [[ -z "$PREPRINT_SEND_KEYWORDS" ]]     && PREPRINT_SEND_KEYWORDS="$(__preprint_extract_tex_meta "$tex_source" "keywords")"
         fi
 
-        # 3b. When updating an existing paper, inherit any still-missing fields (e.g., category/subject!) from the remote entry
         if (( is_update == 1 )) && [[ -n "$PREPRINT_SEND_UPDATE_ID" ]]; then
             __preprint_autofill_from_existing "$db" "$PREPRINT_SEND_UPDATE_ID"
         fi
 
-        # 4. GLOBAL METADATA VALIDATION
         if ! __preprint_is_raw_payload_meta "$PREPRINT_SEND_META"; then
             local -a missing_meta=()
             [[ -z "${PREPRINT_SEND_TITLE//[[:space:]]/}" ]]    && missing_meta+=("--title (-t)")
@@ -1491,7 +1489,6 @@ EOF
 
         [[ -z "$PREPRINT_SEND_DATE" ]] && printf -v PREPRINT_SEND_DATE "%(%Y-%m-%d)T" -1
 
-        # 5. CONFIRMATION SCREEN
         local ext_ids_str="" ek
         for ek in "${!PREPRINT_SEND_EXT_IDS[@]}"; do
             ext_ids_str+="${ext_ids_str:+, }${ek}:${PREPRINT_SEND_EXT_IDS[$ek]}"
@@ -1593,7 +1590,6 @@ EOF
             __preprint_cache_clear "$db"
         fi
 
-        # 6. AUTO-PUBLISH if -p/--publish was passed and provider supports staged publishing
         if (( auto_publish == 1 )) && declare -f "__preprint_provider_${db}_publish" >/dev/null 2>&1; then
             local pub_target="${PREPRINT_LAST_DRAFT_ID:-}"
             if [[ -z "$pub_target" ]]; then
@@ -1605,7 +1601,7 @@ EOF
             fi
         fi
         return 0
-    }
+    }   
 
     __preprint_paper_update() {
         local update_id="" file_arg="" db=""
@@ -1614,7 +1610,7 @@ EOF
         if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
             cat <<'EOF' >&2
 USAGE:
-    preprint paper update [<id>] [<file>] -d/--database <provider> [-p/--publish] [--comments <text>] [metadata-options]
+    preprint paper update <file>.tex --id <existing_id> [-d/--database <provider>] [-p/--publish] [--comments <text>] [metadata-options]
 EOF
             return 0
         fi
@@ -1623,22 +1619,19 @@ EOF
             case "$1" in
                 -d|--database)
                     db="$(__preprint_norm_db "$2")"
+                    passthrough+=("-d" "$2")
                     shift 2
                     ;;
                 --database=*)
                     db="$(__preprint_norm_db "${1#*=}")"
+                    passthrough+=("$1")
                     shift
                     ;;
-                -u|--update)
-                    if [[ $# -ge 2 && "$2" != -* && ! -e "$2" ]] && ! __preprint_is_provider "$2"; then
-                        update_id="$2"; shift 2
-                    else
-                        shift
-                    fi
-                    ;;
-                --update=*)
+                --id|-u|--update)
+                    update_id="$2"; shift 2 ;;
+                --id=*|--update=*)
                     update_id="${1#*=}"; shift ;;
-                -m|-t|-a|-A|-c|--affiliation|--address|--email|--msc|--keywords|--comments|--comment|--changelog|--doi|--url|--journal|--type|--date|--id)
+                -m|-t|-a|-A|-c|--affiliation|--address|--email|--msc|--keywords|--comments|--comment|--changelog|--doi|--url|--journal|--type|--date)
                     passthrough+=("$1" "$2"); shift 2 ;;
                 -*=*)
                     passthrough+=("$1"); shift ;;
@@ -1649,10 +1642,11 @@ EOF
                         file_arg="$1"
                     elif [[ -z "$db" ]] && __preprint_is_provider "$1"; then
                         db="$(__preprint_norm_db "$1")"
-                    elif [[ -z "$update_id" ]]; then
-                        update_id="$1"
+                        passthrough+=("-d" "$1")
                     elif [[ -z "$file_arg" ]]; then
                         file_arg="$1"
+                    elif [[ -z "$update_id" ]]; then
+                        update_id="$1"
                     fi
                     shift
                     ;;
@@ -1673,7 +1667,7 @@ EOF
                 db=$(printf '%s\n' "${reg_dbs[@]}" | fzf --header="Select database to update paper on" --prompt="Database > " --height=40% --layout=reverse --border)
                 [[ -z "$db" ]] && return 0
             else
-                __log "Usage: preprint paper update [<id>] [<file>] -d/--database <provider> [-p/--publish] [--comments <text>]" -t error -l preprint
+                __log "Usage: preprint paper update <file>.tex --id <existing_id> -d/--database <provider> [-p/--publish] [--comments <text>]" -t error -l preprint
                 return 1
             fi
         fi
@@ -1692,11 +1686,8 @@ EOF
                     file_arg="${detected_tex#./}"
                 fi
                 __log "Auto-detected source '${file_arg}' in current directory." -t info -l preprint
-            elif [[ ! -t 0 || ! -t 1 ]]; then
-                __log "Usage: preprint paper update [<id>] <file> -d/--database $db [-p/--publish] [--comments <text>]" -t error -l preprint
-                return 1
             else
-                __log "Usage: preprint paper update [<id>] <file> -d/--database $db [-p/--publish] [--comments <text>]" -t error -l preprint
+                __log "Usage: preprint paper update <file>.tex --id <existing_id> -d/--database $db [-p/--publish] [--comments <text>]" -t error -l preprint
                 return 1
             fi
         fi
@@ -1706,7 +1697,8 @@ EOF
         [[ -n "$file_arg" ]]  && send_args+=("$file_arg")
         send_args+=("${passthrough[@]}")
         __preprint_paper_send "${send_args[@]}"
-    }   
+    }    
+
 
     __preprint_paper_publish() {
         local target="" db=""
