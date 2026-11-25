@@ -1607,24 +1607,30 @@ EOF
         return 0
     }
 
-    # 'preprint paper update [<id>] [<file>] -d <provider> [options]'
     __preprint_paper_update() {
         local update_id="" file_arg="" db=""
         local -a passthrough=()
+
+        if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+            cat <<'EOF' >&2
+USAGE:
+    preprint paper update [<id>] [<file>] -d/--database <provider> [-p/--publish] [--comments <text>] [metadata-options]
+EOF
+            return 0
+        fi
+
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 -d|--database)
-                    db="$2"
-                    passthrough+=("-d" "$2")
+                    db="$(__preprint_norm_db "$2")"
                     shift 2
                     ;;
                 --database=*)
-                    db="${1#*=}"
-                    passthrough+=("$1")
+                    db="$(__preprint_norm_db "${1#*=}")"
                     shift
                     ;;
                 -u|--update)
-                    if [[ $# -ge 2 && "$2" != -* && ! -e "$2" ]]; then
+                    if [[ $# -ge 2 && "$2" != -* && ! -e "$2" ]] && ! __preprint_is_provider "$2"; then
                         update_id="$2"; shift 2
                     else
                         shift
@@ -1641,11 +1647,10 @@ EOF
                 *)
                     if [[ -e "$1" && -z "$file_arg" ]]; then
                         file_arg="$1"
-                    elif [[ -z "$update_id" ]] && ! __preprint_is_provider "$1"; then
-                        update_id="$1"
                     elif [[ -z "$db" ]] && __preprint_is_provider "$1"; then
-                        db="$1"
-                        passthrough+=("-d" "$1")
+                        db="$(__preprint_norm_db "$1")"
+                    elif [[ -z "$update_id" ]]; then
+                        update_id="$1"
                     elif [[ -z "$file_arg" ]]; then
                         file_arg="$1"
                     fi
@@ -1654,12 +1659,54 @@ EOF
             esac
         done
 
-        local -a send_args=("-u")
+        if [[ -z "$db" ]]; then
+            __preprint_load_omnirc
+            local -a reg_dbs=()
+            local p
+            for p in "${PREPRINT_PROVIDERS[@]}"; do
+                __preprint_is_profile_registered "$p" && reg_dbs+=("$p")
+            done
+
+            if (( ${#reg_dbs[@]} == 1 )); then
+                db="${reg_dbs[0]}"
+            elif (( ${#reg_dbs[@]} > 1 )) && [[ -t 0 && -t 1 ]] && command -v fzf >/dev/null 2>&1; then
+                db=$(printf '%s\n' "${reg_dbs[@]}" | fzf --header="Select database to update paper on" --prompt="Database > " --height=40% --layout=reverse --border)
+                [[ -z "$db" ]] && return 0
+            else
+                __log "Usage: preprint paper update [<id>] [<file>] -d/--database <provider> [-p/--publish] [--comments <text>]" -t error -l preprint
+                return 1
+            fi
+        fi
+
+        __preprint_require_registered_profile "$db" || return 1
+
+        local req_file="${PREPRINT_PROVIDER_META["${db}:requires_file"]:-true}"
+        if [[ "$req_file" == "true" && -z "$file_arg" ]]; then
+            local detected_tex=""
+            detected_tex="$(__preprint_find_dir_tex ".")" || true
+            if [[ -n "$detected_tex" ]]; then
+                local -a all_tex=( *.tex )
+                if (( ${#all_tex[@]} > 1 )) || [[ -d "./anc" || -d "./figures" ]] || compgen -G "./*.bib" >/dev/null || compgen -G "./*.sty" >/dev/null; then
+                    file_arg="."
+                else
+                    file_arg="${detected_tex#./}"
+                fi
+                __log "Auto-detected source '${file_arg}' in current directory." -t info -l preprint
+            elif [[ ! -t 0 || ! -t 1 ]]; then
+                __log "Usage: preprint paper update [<id>] <file> -d/--database $db [-p/--publish] [--comments <text>]" -t error -l preprint
+                return 1
+            else
+                __log "Usage: preprint paper update [<id>] <file> -d/--database $db [-p/--publish] [--comments <text>]" -t error -l preprint
+                return 1
+            fi
+        fi
+
+        local -a send_args=("-d" "$db" "-u")
         [[ -n "$update_id" ]] && send_args+=("$update_id")
         [[ -n "$file_arg" ]]  && send_args+=("$file_arg")
         send_args+=("${passthrough[@]}")
         __preprint_paper_send "${send_args[@]}"
-    }
+    }   
 
     __preprint_paper_publish() {
         local target="" db=""
