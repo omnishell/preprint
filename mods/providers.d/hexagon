@@ -6,7 +6,7 @@ __hexagon__() {
         --pagination "offset" \
         --requires-file "true" \
         --requires-category "true" \
-        --desc "Hexagon Math preprint server (OpenAPI v1.13: TeX/ZIP draft staging, preview & commit)"
+        --desc "Hexagon Math preprint server (OpenAPI v1.13: TeX/ZIP staging, revisions & commit)"
 
     __preprint_hexagon_base_url() {
         local sb
@@ -48,14 +48,15 @@ __hexagon__() {
             math.CO)         echo "05A15" ;;
             math.PR)         echo "60B20" ;;
             math.LO|cs.LO)   echo "03B10" ;;
+            math.CT)         echo "18B25" ;;
             cs.AI)           echo "68T01" ;;
             *)               echo "00A05" ;;
         esac
     }
 
     __preprint_parse_hexagon() {
-        local mode="${1:-compact}" base_url="${2:-https://hexagonmath.org}" filter_str="${3:-}"
-        LC_ALL=C awk -v mode="$mode" -v base_url="$base_url" -v filter_str="$filter_str" '
+        local mode="${1:-compact}" base_url="${2:-https://hexagonmath.org}" filter_orcid="${3:-}" filter_author="${4:-}"
+        LC_ALL=C awk -v mode="$mode" -v base_url="$base_url" -v filter_orcid="$filter_orcid" -v filter_author="$filter_author" '
             function unesc_json(s) {
                 gsub(/\\"/, "\"", s); gsub(/\\\\/, "\\", s)
                 gsub(/\\n/, " ", s); gsub(/\\r/, "", s); gsub(/\\t/, " ", s)
@@ -119,20 +120,39 @@ __hexagon__() {
                 return "N/A"
             }
             function get_json_date(chunk, id,    d, keys, n, i) {
-                n = split("submitted_at,submission_date,published_at,publication_date,released_at,created_at,updated_at,publishedAt,submittedAt,createdAt,date", keys, ",")
+                n = split("publishedAt,published_at,publication_date,submittedAt,submitted_at,submission_date,released_at,versionCreatedAt,createdAt,created_at,updated_at,date", keys, ",")
                 for (i = 1; i <= n; i++) {
                     d = get_json_str(chunk, keys[i])
                     if (d != "") return norm_date(d, id)
                 }
-                if (match(chunk, /"20[0-9]{2}-[0-9]{2}-[0-9]{2}(T[0-9:.+-Z]+)?"/)) {
+                if (match(chunk, /"20[0-9]{2}-[0-9]{2}-[0-9]{2}([T ][0-9:.+-Z]+)?"/)) {
                     return substr(chunk, RSTART + 1, 10)
                 }
                 return norm_date("", id)
             }
-            function get_json_authors(chunk,    s, out, pat, m) {
+            function get_json_authors(chunk,    s, out, pat, m, depth, i, c, in_str, esc, arr_start) {
                 out = ""
-                if (match(chunk, /"(contributors|authors|creators)"[ \t]*:[ \t]*\[[^\]]*\]/)) {
-                    s = substr(chunk, RSTART, RLENGTH)
+                if (match(chunk, /"(contributors|authors|creators)"[ \t]*:[ \t]*\[/)) {
+                    arr_start = RSTART + RLENGTH - 1
+                    depth = 0; in_str = 0; esc = 0
+                    for (i = arr_start; i <= length(chunk); i++) {
+                        c = substr(chunk, i, 1)
+                        if (in_str) {
+                            if (esc) esc = 0
+                            else if (c == "\\") esc = 1
+                            else if (c == "\"") in_str = 0
+                            continue
+                        }
+                        if (c == "\"") { in_str = 1; continue }
+                        if (c == "[") depth++
+                        else if (c == "]") {
+                            depth--
+                            if (depth == 0) {
+                                s = substr(chunk, arr_start, i - arr_start + 1)
+                                break
+                            }
+                        }
+                    }
                     pat = "\"(name|full_name|display_name|author_name|credit_name)\"[ \t]*:[ \t]*\"(\\\\.|[^\"\\\\])*\""
                     while (match(s, pat)) {
                         m = substr(s, RSTART, RLENGTH)
@@ -147,7 +167,33 @@ __hexagon__() {
                 if (out == "") out = get_json_str(chunk, "sponsorName")
                 return out
             }
-            function pick_best_id(chunk,    s, m, best, base) {
+            function chunk_has_orcid(chunk, target_orcid,    s, m, val, norm_target) {
+                norm_target = tolower(target_orcid)
+                sub(/^https?:\/\/orcid\.org\//, "", norm_target)
+                gsub(/^[ \t]+|[ \t]+$/, "", norm_target)
+                if (norm_target == "") return 0
+
+                s = chunk
+                while (match(s, /"orcid"[ \t]*:[ \t]*"[^"]*"/)) {
+                    m = substr(s, RSTART, RLENGTH)
+                    s = substr(s, RSTART + RLENGTH)
+                    sub(/^"orcid"[ \t]*:[ \t]*"/, "", m)
+                    sub(/"$/, "", m)
+                    val = tolower(unesc_json(m))
+                    sub(/^https?:\/\/orcid\.org\//, "", val)
+                    gsub(/^[ \t]+|[ \t]+$/, "", val)
+                    if (val == norm_target) return 1
+                }
+                return 0
+            }
+            function pick_best_id(chunk,    id, ver, s, m, best, base) {
+                id = get_json_str(chunk, "identifier")
+                ver = get_json_num(chunk, "versionNumber")
+                if (id != "") {
+                    sub(/^hexagon:/, "", id)
+                    if (ver != "" && id !~ /v[0-9]+$/) id = id "v" ver
+                    return id
+                }
                 s = chunk; best = ""
                 while (match(s, /(hexagon:)?[0-9]{4}\.[0-9]{4,5}(v[0-9]+)?/)) {
                     m = substr(s, RSTART, RLENGTH)
@@ -159,16 +205,24 @@ __hexagon__() {
                         if (m ~ ("^" base "v[0-9]+$") && best !~ /v[0-9]+$/) best = m
                     }
                 }
-                if (best == "") best = get_json_str(chunk, "identifier")
                 if (best == "") best = get_json_str(chunk, "draftId")
                 if (best == "") best = get_json_str(chunk, "id")
                 sub(/^hexagon:/, "", best)
+                if (best != "" && ver != "" && best ~ /^[0-9]{4}\.[0-9]{4,5}$/) best = best "v" ver
                 return best
             }
-            function extract_array_objects(src, objs,    len, i, c, in_str, esc, arr_depth, obj_depth, start_pos, n) {
+            function extract_works_objects(src, objs,    arr_idx, len, i, c, in_str, esc, arr_depth, obj_depth, start_pos, n) {
+                arr_idx = 0
+                if (match(src, /"(works|items|results|submissions|data)"[ \t]*:[ \t]*\[/)) {
+                    arr_idx = RSTART + RLENGTH - 1
+                } else if (match(src, /^[ \t\r\n]*\[/)) {
+                    arr_idx = RSTART + RLENGTH - 1
+                }
+                if (arr_idx == 0) return 0
+
                 len = length(src)
                 in_str = 0; esc = 0; arr_depth = 0; obj_depth = 0; start_pos = 0; n = 0
-                for (i = 1; i <= len; i++) {
+                for (i = arr_idx; i <= len; i++) {
                     c = substr(src, i, 1)
                     if (in_str) {
                         if (esc) { esc = 0 }
@@ -180,13 +234,14 @@ __hexagon__() {
                     if (c == "[") {
                         arr_depth++
                     } else if (c == "]") {
-                        if (arr_depth > 0) arr_depth--
+                        arr_depth--
+                        if (arr_depth <= 0) break
                     } else if (c == "{") {
-                        if (arr_depth >= 1 && obj_depth == 0) start_pos = i
+                        if (arr_depth == 1 && obj_depth == 0) start_pos = i
                         obj_depth++
                     } else if (c == "}") {
                         if (obj_depth > 0) obj_depth--
-                        if (arr_depth >= 1 && obj_depth == 0 && start_pos > 0) {
+                        if (arr_depth == 1 && obj_depth == 0 && start_pos > 0) {
                             objs[++n] = substr(src, start_pos, i - start_pos + 1)
                             start_pos = 0
                         }
@@ -194,16 +249,18 @@ __hexagon__() {
                 }
                 return n
             }
-            function matches_filter(chunk, authors, title,    n, i, terms, t, hay) {
-                if (filter_str == "") return 1
-                hay = tolower(chunk "\n" authors "\n" title)
-                n = split(tolower(filter_str), terms, "|")
-                for (i = 1; i <= n; i++) {
-                    t = terms[i]
-                    gsub(/^[ \t]+|[ \t]+$/, "", t)
-                    if (t != "" && index(hay, t) > 0) return 1
+            function matches_profile(chunk, authors,    sponsor, hay, needle) {
+                if (filter_orcid != "") {
+                    return chunk_has_orcid(chunk, filter_orcid)
                 }
-                return 0
+                if (filter_author != "") {
+                    sponsor = get_json_str(chunk, "sponsorName")
+                    hay = tolower(authors "\n" sponsor)
+                    needle = tolower(filter_author)
+                    gsub(/^[ \t]+|[ \t]+$/, "", needle)
+                    return (needle != "" && index(hay, needle) > 0)
+                }
+                return 1
             }
             { raw = raw $0 "\n" }
             END {
@@ -245,20 +302,28 @@ __hexagon__() {
                         tags = get_json_str_array(raw, "tags", "; ")
                         if (tags == "") tags = "N/A"
                         pages = get_json_num(raw, "pageCount"); if (pages == "") pages = "N/A"
+                        comments = get_json_str(raw, "comments"); if (comments == "") comments = "-"
                         abs = get_json_str(raw, "abstract"); if (abs == "") abs = get_json_str(raw, "summary")
                         st = (is_json_draft(raw) ? "DRAFT" : "PUBLISHED")
                         if (st == "DRAFT") {
-                            printf "DraftId:   %s\nStatus:    %s\nTitle:     %s\nCreated:   %s\nAuthors:   %s\nSubject:   %s\nMSC:       %s\nKeywords:  %s\nPreview:   %s/api/v1/submissions/%s/preview/pdf\nAbstract:\n  %s\n", id, st, title, pub, authors, cat, msc, tags, base_url, id, abs
+                            printf "DraftId:   %s\nStatus:    %s\nTitle:     %s\nCreated:   %s\nAuthors:   %s\nSubject:   %s\nMSC:       %s\nKeywords:  %s\nComments:  %s\nPreview:   %s/api/v1/submissions/%s/preview/pdf\nAbstract:\n  %s\n", id, st, title, pub, authors, cat, msc, tags, comments, base_url, id, abs
                         } else {
-                            printf "ID:        hexagon:%s\nStatus:    %s\nTitle:     %s\nPublished: %s\nAuthors:   %s\nSubject:   %s\nMSC:       %s\nKeywords:  %s\nPages:     %s\nURL:       %s/abs/%s\nPDF:       %s/pdf/%s\nSource:    %s/src/%s\nAbstract:\n  %s\n", id, st, title, pub, authors, cat, msc, tags, pages, base_url, id, base_url, id, base_url, id, abs
+                            printf "ID:        hexagon:%s\nStatus:    %s\nTitle:     %s\nPublished: %s\nAuthors:   %s\nSubject:   %s\nMSC:       %s\nKeywords:  %s\nComments:  %s\nPages:     %s\nURL:       %s/abs/%s\nPDF:       %s/pdf/%s\nSource:    %s/src/%s\nAbstract:\n  %s\n", id, st, title, pub, authors, cat, msc, tags, comments, pages, base_url, id, base_url, id, base_url, id, abs
                         }
                         exit 0
                     }
 
-                    n = extract_array_objects(raw, items)
-                    if (n == 0 && raw ~ /^[ \t\r\n]*\{/) {
+                    n = extract_works_objects(raw, items)
+                    if (n == 0 && raw ~ /^[ \t\r\n]*\{/ && raw !~ /"works"[ \t]*:[ \t]*\[/) {
                         items[1] = raw
                         n = 1
+                    }
+
+                    if (mode == "page") {
+                        nc = get_json_str(raw, "nextCursor")
+                        if (nc == "") nc = get_json_str(raw, "next_cursor")
+                        if (nc == "null") nc = ""
+                        printf "__PAGE_META__\t%d\t%s\n", n, nc
                     }
 
                     count = 0
@@ -272,14 +337,14 @@ __hexagon__() {
                         if (title == "") continue
                         authors = get_json_authors(chunk)
                         if (authors == "") authors = "Unknown Contributor"
-                        if (!matches_filter(chunk, authors, title)) continue
+                        if (!matches_profile(chunk, authors)) continue
                         seen[base_id] = 1
                         pub = get_json_date(chunk, id)
-                        badge = (is_json_draft(chunk) ? "[DRAFT] " : "")
+                        badge = (is_json_draft(chunk) ? "[DRAFT] " : "[PUBLISHED] ")
                         printf "[%s] (%s) %s%s   %s\n", id, pub, badge, title, authors
                         count++
                     }
-                    if (count == 0) exit 1
+                    if (mode != "page" && count == 0) exit 1
                     exit 0
                 }
                 exit 1
@@ -315,9 +380,92 @@ __hexagon__() {
         __preprint_save_pdf_stream "$pdf_url" "hexagon_${clean_id//\//_}.pdf" "$out_path" "${pdf_url}.pdf"
     }
 
+    __preprint_hexagon_orcid_surname() {
+        local orcid="$1"
+        local cache_dir="${XDG_DATA_HOME:-$HOME/.local/share}/omni/preprint/cache"
+        mkdir -p "$cache_dir"
+        local name_cache="${cache_dir}/orcid_${orcid//[^a-zA-Z0-9_-]/_}.name"
+        if [[ -s "$name_cache" ]]; then
+            cat "$name_cache"
+            return 0
+        fi
+
+        local fam=""
+        fam=$(curl -fsSL --max-time 5 -H "Accept: application/vnd.orcid+xml" "https://pub.orcid.org/v3.0/${orcid}/person" 2>/dev/null | LC_ALL=C awk '
+            function strip_tag(s) { gsub(/<[^>]+>/, "", s); gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s); return s }
+            /<personal-details:family-names[^>]*>/ { fn = strip_tag($0) }
+            /<personal-details:credit-name[^>]*>/  { cn = strip_tag($0) }
+            END {
+                if (fn != "") print fn
+                else if (cn != "") print cn
+            }
+        ')
+
+        if [[ -z "$fam" ]]; then
+            fam=$(curl -fsSL --max-time 5 "https://api.openalex.org/authors/https://orcid.org/${orcid}" 2>/dev/null | LC_ALL=C awk '
+                match($0, /"display_name"[ \t]*:[ \t]*"[^"]+"/) {
+                    s = substr($0, RSTART, RLENGTH)
+                    sub(/^"display_name"[ \t]*:[ \t]*"/, "", s); sub(/"$/, "", s)
+                    n = split(s, parts, " ")
+                    if (n > 0) print parts[n]
+                    exit
+                }
+            ')
+        fi
+
+        if [[ -n "$fam" ]]; then
+            local last_word="${fam##* }"
+            [[ -z "$last_word" ]] && last_word="$fam"
+            printf '%s\n' "$last_word" > "$name_cache"
+            echo "$last_word"
+        fi
+    }
+
+    __preprint_hexagon_fetch_works_cursor() {
+        local base_url="$1" query_params="$2" filter_orcid="$3" filter_author="$4" max_pages="${5:-20}"
+        local page_limit=100 cursor="" prev_cursor="" page=0 resp parsed meta_line raw_count=0 page_out all_out=""
+
+        while (( page < max_pages )); do
+            local url="${base_url}/api/v1/works?limit=${page_limit}"
+            [[ -n "$query_params" ]] && url+="&${query_params}"
+            [[ -n "$cursor" ]] && url+="&cursor=$(__preprint_urlencode "$cursor")"
+
+            resp=$(curl -fsSL -H "Accept: application/json" "$url" 2>/dev/null)
+            [[ -z "$resp" ]] && break
+
+            parsed=$(__preprint_parse_hexagon "page" "$base_url" "$filter_orcid" "$filter_author" <<< "$resp" 2>/dev/null)
+            [[ -z "$parsed" ]] && break
+
+            meta_line="${parsed%%$'\n'*}"
+            if [[ "$parsed" == *$'\n'* ]]; then
+                page_out="${parsed#*$'\n'}"
+            else
+                page_out=""
+            fi
+
+            [[ -n "$page_out" ]] && all_out="${all_out:+$all_out$'\n'}${page_out}"
+
+            raw_count=0
+            prev_cursor="$cursor"
+            cursor=""
+            if [[ "$meta_line" == __PAGE_META__$'\t'* ]]; then
+                local rest="${meta_line#*$'\t'}"
+                raw_count="${rest%%$'\t'*}"
+                cursor="${rest#*$'\t'}"
+            fi
+
+            if (( raw_count < page_limit )); then
+                break
+            fi
+            [[ -z "$cursor" || "$cursor" == "$prev_cursor" ]] && break
+            ((page++))
+        done
+
+        [[ -n "$all_out" ]] && printf '%s\n' "$all_out" | LC_ALL=C awk '!seen[$0]++'
+    }
+
     __preprint_provider_hexagon_list() {
         local max="${1:-0}" sort_by="${2:-time}" reverse="${3:-0}"
-        local limit=$(( max > 0 ? max : 100 ))
         local base_url profile orcid
         base_url="$(__preprint_hexagon_base_url)"
         profile="${HEXAGON_PROFILE:-$(__preprint_get_conf hexagon profile)}"
@@ -326,30 +474,23 @@ __hexagon__() {
         orcid="${HEXAGON_ORCID:-$(__preprint_get_conf hexagon orcid)}"
         [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid orcid)"
 
-        # If profile is not set but ORCID is, resolve the researcher's name from ORCID
-        local orcid_name=""
-        if [[ -z "$profile" && -n "$orcid" ]]; then
-            orcid_name=$(curl -fsSL -H "Accept: application/vnd.orcid+xml" "https://pub.orcid.org/v3.0/${orcid}/person" 2>/dev/null | LC_ALL=C awk '
-                function strip_tag(s) { gsub(/<[^>]+>/, "", s); gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s); return s }
-                /<personal-details:given-names>/  { gn = strip_tag($0) }
-                /<personal-details:family-names>/ { fn = strip_tag($0) }
-                /<personal-details:credit-name>/  { cn = strip_tag($0) }
-                END {
-                    if (cn != "") print cn
-                    else if (gn != "" || fn != "") print gn (gn && fn ? " " : "") fn
-                }
-            ')
-        fi
+        local out=""
 
-        local filter_terms=""
-        [[ -n "$profile" ]]    && filter_terms+="${filter_terms:+|}${profile}"
-        [[ -n "$orcid" ]]      && filter_terms+="${filter_terms:+|}${orcid}"
-        [[ -n "$orcid_name" ]] && filter_terms+="${filter_terms:+|}${orcid_name}"
-
-        local resp out=""
-        resp=$(curl -fsSL -H "Accept: application/json" "${base_url}/api/v1/works?limit=${limit}" 2>/dev/null)
-        if [[ -n "$resp" ]]; then
-            out=$(__preprint_parse_hexagon "compact" "$base_url" "$filter_terms" <<< "$resp" 2>/dev/null)
+        if [[ -n "$orcid" ]]; then
+            local orcid_family="${profile:-$(__preprint_hexagon_orcid_surname "$orcid")}"
+            if [[ -n "$orcid_family" ]]; then
+                local enc_fam=$(__preprint_urlencode "${orcid_family:0:45}")
+                out=$(__preprint_hexagon_fetch_works_cursor "$base_url" "author=${enc_fam}" "$orcid" "" 5)
+            fi
+            if [[ -z "$out" ]]; then
+                out=$(__preprint_hexagon_fetch_works_cursor "$base_url" "" "$orcid" "" 20)
+            fi
+        elif [[ -n "$profile" ]]; then
+            local enc_prof=$(__preprint_urlencode "${profile:0:45}")
+            out=$(__preprint_hexagon_fetch_works_cursor "$base_url" "author=${enc_prof}" "" "$profile" 5)
+            if [[ -z "$out" ]]; then
+                out=$(__preprint_hexagon_fetch_works_cursor "$base_url" "sponsor=${enc_prof}" "" "$profile" 5)
+            fi
         fi
 
         if [[ -n "$out" ]]; then
@@ -398,12 +539,13 @@ __hexagon__() {
     __preprint_provider_hexagon_search() {
         local term="$1" limit="${2:-50}" offset="${3:-0}" sort_by="${4:-time}" reverse="${5:-0}"
         local base_url="$(__preprint_hexagon_base_url)"
-        local short_term="${term:0:48}"
+        (( limit > 100 )) && limit=100
+        local short_term="${term:0:45}"
         local enc_term=$(__preprint_urlencode "$short_term")
         local resp out=""
 
         resp=$(curl -fsSL -H "Accept: application/json" "${base_url}/api/v1/works?q=${enc_term}&limit=${limit}" 2>/dev/null)
-        [[ -n "$resp" ]] && out=$(__preprint_parse_hexagon "compact" "$base_url" "$short_term" <<< "$resp" 2>/dev/null)
+        [[ -n "$resp" ]] && out=$(__preprint_parse_hexagon "compact" "$base_url" "" "" <<< "$resp" 2>/dev/null)
 
         if [[ -z "$out" ]]; then
             local atom_order="descending"
@@ -417,11 +559,14 @@ __hexagon__() {
         [[ -n "$out" ]] && echo "$out" || echo "No entries found in Hexagon Math."
     }
 
-    __preprint_provider_hexagon_send() {
+    # Shared upload + metadata staging engine for both 'send' (new) and 'update' (new version)
+    __preprint_hexagon_stage_deposit() {
+        local revise_target="${1:-}"
         local file="$PREPRINT_SEND_FILE" meta="$PREPRINT_SEND_META" title="$PREPRINT_SEND_TITLE"
         local author="$PREPRINT_SEND_AUTHOR" abstract="$PREPRINT_SEND_ABSTRACT"
         local category="$PREPRINT_SEND_CATEGORY" pub_date="$PREPRINT_SEND_DATE"
         local msc_raw="${PREPRINT_SEND_MSC:-}" kw_raw="${PREPRINT_SEND_KEYWORDS:-}"
+        local comments="${PREPRINT_SEND_COMMENTS:-}"
         local arxiv_id="${PREPRINT_SEND_EXT_IDS[arxiv]:-}"
 
         if [[ -n "$category" ]] && ! __preprint_hexagon_validate_subject "$category"; then
@@ -441,7 +586,7 @@ __hexagon__() {
         [[ -z "$sponsor" ]] && sponsor="${HEXAGON_USER:-$(__preprint_get_conf hexagon user)}"
 
         if [[ -z "$token" ]]; then
-            __log "Hexagon Math submission bearer token missing. Run: preprint conf set hexagon --token <TOKEN>" -t error -l preprint
+            __log "Hexagon Math submission bearer token missing. Run: preprint db set hexagon --token <TOKEN>" -t error -l preprint
             return 1
         fi
 
@@ -459,7 +604,7 @@ __hexagon__() {
             upload_kind="source"
             content_type="text/x-tex"
         else
-            __log "Hexagon Math requires a .tex source file or .zip source archive (got '$file')." -t error -l preprint
+            __log "Hexagon Math requires a .tex source file, source directory, or .zip source archive (got '$file')." -t error -l preprint
             return 1
         fi
 
@@ -501,6 +646,9 @@ __hexagon__() {
             [[ -n "$tags_json_arr" ]] && tags_field=",\"tags\":[${tags_json_arr}]"
         fi
 
+        local comments_field=""
+        [[ -n "$comments" ]] && comments_field=",\"comments\":\"$(__preprint_json_escape "${comments:0:2000}")\""
+
         local meta_json=""
         if __preprint_is_raw_payload_meta "$meta"; then
             meta_json=$(<"$meta")
@@ -518,62 +666,119 @@ __hexagon__() {
                 [[ -z "$a" ]] && continue
                 authors_json+="${authors_json:+,}{\"name\":\"$(__preprint_json_escape "$a")\"}"
             done
-            [[ -n "$arxiv_id" ]] && arxiv_field=",\"arxivId\":\"$(__preprint_json_escape "$arxiv_id")\""
+            [[ -z "$revise_target" && -n "$arxiv_id" ]] && arxiv_field=",\"arxivId\":\"$(__preprint_json_escape "$arxiv_id")\""
 
-            meta_json="{\"title\":\"${esc_title}\",\"abstract\":\"${esc_abs}\",\"subject\":\"${esc_subj}\",\"mscCodes\":[${msc_json_arr}]${tags_field},\"authorshipMode\":\"human\",\"authors\":[${authors_json}],\"submittingContributorIndex\":0,\"sponsorName\":\"${esc_sponsor}\",\"humanUnderstanding\":\"all\",\"correctnessConfirmed\":true,\"communityInterestConfirmed\":true,\"citationsConfirmed\":true,\"license\":\"CC BY 4.0\",\"rightsConfirmed\":true${arxiv_field}}"
+            meta_json="{\"title\":\"${esc_title}\",\"abstract\":\"${esc_abs}\"${comments_field},\"subject\":\"${esc_subj}\",\"mscCodes\":[${msc_json_arr}]${tags_field},\"authorshipMode\":\"human\",\"authors\":[${authors_json}],\"submittingContributorIndex\":0,\"sponsorName\":\"${esc_sponsor}\",\"humanUnderstanding\":\"all\",\"correctnessConfirmed\":true,\"communityInterestConfirmed\":true,\"citationsConfirmed\":true,\"license\":\"CC BY 4.0\",\"rightsConfirmed\":true${arxiv_field}}"
         fi
 
         local fname="$(basename "$upload_target")"
-        local existing_draft_id=""
-        existing_draft_id=$(LC_ALL=C awk -F'\t' -v fn="$fname" -v t="$title" '
-            $1 == "hexagon" && ($4 == t || $7 ~ ("\\|" fn "$") || $6 ~ (fn "$")) { print $2; exit }
-        ' "$(__preprint_draft_store_file)" 2>/dev/null)
-
         local resp http_code body draft_id=""
-        if [[ -n "$existing_draft_id" ]]; then
-            __log "Step 1/4: Overwriting existing Hexagon draft '$existing_draft_id' metadata (category: $subject)..." -t info -l preprint
+
+        # A. REVISION FLOW ('preprint paper update' / 'preprint paper send -u <id>')
+        if [[ -n "$revise_target" ]]; then
+            local clean_rev="${revise_target#hexagon:}"
+            # Strip trailing vN if it's a published identifier like 2611.00532v1
+            if [[ "$clean_rev" =~ ^([0-9]{4}\.[0-9]{4,5})v[0-9]+$ ]]; then
+                clean_rev="${BASH_REMATCH[1]}"
+            fi
+
+            __log "Step 1/4: Opening revision draft for '$clean_rev' (${base_url}/api/v1/submissions/${clean_rev}/revise)..." -t info -l preprint
+            resp=$(curl -sS -w "\n%{http_code}" -X POST \
+                -H "Authorization: Bearer $token" \
+                -H "Accept: application/json" \
+                "${base_url}/api/v1/submissions/${clean_rev}/revise" 2>&1)
+            http_code="${resp##*$'\n'}"
+            body="${resp%$'\n'*}"
+
+            if [[ "$http_code" == "409" ]]; then
+                # If it was an unpublished committed package, pause for corrections first, then revise
+                curl -sS -X POST -H "Authorization: Bearer $token" "${base_url}/api/v1/submissions/${clean_rev}/corrections" >/dev/null 2>&1 || true
+                resp=$(curl -sS -w "\n%{http_code}" -X POST \
+                    -H "Authorization: Bearer $token" \
+                    -H "Accept: application/json" \
+                    "${base_url}/api/v1/submissions/${clean_rev}/revise" 2>&1)
+                http_code="${resp##*$'\n'}"
+                body="${resp%$'\n'*}"
+            fi
+
+            if [[ "$http_code" =~ ^20[01]$ ]]; then
+                draft_id=$(__preprint_parse_hexagon "extract_draft_id" "$base_url" <<< "$body")
+                [[ -z "$draft_id" ]] && draft_id="$clean_rev"
+            elif __preprint_draft_get "hexagon" "$clean_rev" >/dev/null 2>&1; then
+                draft_id="$clean_rev"
+            else
+                [[ -n "$tmp_zip" ]] && rm -f "$tmp_zip"
+                __log "Failed to open revision draft for '$clean_rev' on Hexagon (HTTP $http_code)." -t error -l preprint
+                echo "$body" >&2
+                return 1
+            fi
+
+            __log "Updating metadata on revision draft '$draft_id'..." -t info -l preprint
             resp=$(curl -sS -w "\n%{http_code}" -X PATCH \
                 -H "Authorization: Bearer $token" \
                 -H "Content-Type: application/json" \
                 -d "$meta_json" \
-                "${base_url}/api/v1/submissions/${existing_draft_id}" 2>&1)
+                "${base_url}/api/v1/submissions/${draft_id}" 2>&1)
             http_code="${resp##*$'\n'}"
             body="${resp%$'\n'*}"
-            if [[ "$http_code" == "200" ]]; then
-                draft_id="$existing_draft_id"
-            else
-                __log "Draft '$existing_draft_id' is no longer editable on Hexagon (HTTP $http_code); creating a new draft..." -t warning -l preprint
-                __preprint_draft_rm "hexagon" "$existing_draft_id"
-            fi
-        fi
-
-        if [[ -z "$draft_id" ]]; then
-            local idem_key
-            idem_key="omni-$(printf '%s-%s-%s' "$fname" "$title" "$subject" | cksum | awk '{print $1}')-$(date +%Y%m%d%H%M%S)"
-
-            __log "Step 1/4: Creating Hexagon deposit draft (${base_url}/api/v1/submissions)..." -t info -l preprint
-            resp=$(curl -sS -w "\n%{http_code}" -X POST \
-                -H "Authorization: Bearer $token" \
-                -H "Idempotency-Key: $idem_key" \
-                -H "Content-Type: application/json" \
-                -d "$meta_json" \
-                "${base_url}/api/v1/submissions" 2>&1)
-            http_code="${resp##*$'\n'}"
-            body="${resp%$'\n'*}"
-
-            if [[ ! "$http_code" =~ ^20[01]$ ]]; then
+            if [[ "$http_code" != "200" ]]; then
                 [[ -n "$tmp_zip" ]] && rm -f "$tmp_zip"
-                __log "Failed to create Hexagon draft (HTTP $http_code)." -t error -l preprint
+                __log "Failed updating metadata on revision draft '$draft_id' (HTTP $http_code)." -t error -l preprint
                 echo "$body" >&2
                 return 1
             fi
+        else
+            # B. NEW SUBMISSION FLOW ('preprint paper send')
+            local existing_draft_id=""
+            existing_draft_id=$(LC_ALL=C awk -F'\t' -v fn="$fname" -v t="$title" '
+                $1 == "hexagon" && ($4 == t || $7 ~ ("\\|" fn "$") || $6 ~ (fn "$")) { print $2; exit }
+            ' "$(__preprint_draft_store_file)" 2>/dev/null)
 
-            draft_id=$(__preprint_parse_hexagon "extract_draft_id" "$base_url" <<< "$body")
+            if [[ -n "$existing_draft_id" ]]; then
+                __log "Step 1/4: Overwriting existing Hexagon draft '$existing_draft_id' metadata (category: $subject)..." -t info -l preprint
+                resp=$(curl -sS -w "\n%{http_code}" -X PATCH \
+                    -H "Authorization: Bearer $token" \
+                    -H "Content-Type: application/json" \
+                    -d "$meta_json" \
+                    "${base_url}/api/v1/submissions/${existing_draft_id}" 2>&1)
+                http_code="${resp##*$'\n'}"
+                body="${resp%$'\n'*}"
+                if [[ "$http_code" == "200" ]]; then
+                    draft_id="$existing_draft_id"
+                else
+                    __log "Draft '$existing_draft_id' is no longer editable on Hexagon (HTTP $http_code); creating a new draft..." -t warning -l preprint
+                    __preprint_draft_rm "hexagon" "$existing_draft_id"
+                fi
+            fi
+
             if [[ -z "$draft_id" ]]; then
-                [[ -n "$tmp_zip" ]] && rm -f "$tmp_zip"
-                __log "Could not parse draftId from Hexagon response:" -t error -l preprint
-                echo "$body" >&2
-                return 1
+                local idem_key
+                idem_key="omni-$(printf '%s-%s-%s' "$fname" "$title" "$subject" | cksum | awk '{print $1}')-$(date +%Y%m%d%H%M%S)"
+
+                __log "Step 1/4: Creating Hexagon deposit draft (${base_url}/api/v1/submissions)..." -t info -l preprint
+                resp=$(curl -sS -w "\n%{http_code}" -X POST \
+                    -H "Authorization: Bearer $token" \
+                    -H "Idempotency-Key: $idem_key" \
+                    -H "Content-Type: application/json" \
+                    -d "$meta_json" \
+                    "${base_url}/api/v1/submissions" 2>&1)
+                http_code="${resp##*$'\n'}"
+                body="${resp%$'\n'*}"
+
+                if [[ ! "$http_code" =~ ^20[01]$ ]]; then
+                    [[ -n "$tmp_zip" ]] && rm -f "$tmp_zip"
+                    __log "Failed to create Hexagon draft (HTTP $http_code)." -t error -l preprint
+                    echo "$body" >&2
+                    return 1
+                fi
+
+                draft_id=$(__preprint_parse_hexagon "extract_draft_id" "$base_url" <<< "$body")
+                if [[ -z "$draft_id" ]]; then
+                    [[ -n "$tmp_zip" ]] && rm -f "$tmp_zip"
+                    __log "Could not parse draftId from Hexagon response:" -t error -l preprint
+                    echo "$body" >&2
+                    return 1
+                fi
             fi
         fi
 
@@ -662,14 +867,24 @@ __hexagon__() {
             fi
         fi
 
+        PREPRINT_LAST_DRAFT_ID="$draft_id"
         __preprint_draft_save "hexagon" "$draft_id" "$pub_date" "$title" "${author//;/, }" "-" "${subject}|${fname}"
         __log "Hexagon Math draft staged! Draft ID: $draft_id" -t success -l preprint
-        __log "Run 'preprint get $draft_id -d hexagon' to inspect, or 'preprint publish $draft_id -d hexagon' to commit & publish." -t info -l preprint
+        __log "Run 'preprint paper get $draft_id -d hexagon' to inspect, or 'preprint paper publish $draft_id -d hexagon' to commit & publish." -t info -l preprint
+    }
+
+    __preprint_provider_hexagon_send() {
+        __preprint_hexagon_stage_deposit ""
+    }
+
+    __preprint_provider_hexagon_update() {
+        local target_id="$1"
+        __preprint_hexagon_stage_deposit "$target_id"
     }
 
     __preprint_provider_hexagon_publish() {
         local draft_id="${1#hexagon:}"
-        [[ -z "$draft_id" ]] && { __log "Draft ID required: preprint publish <draftId> -d hexagon" -t error -l preprint; return 1; }
+        [[ -z "$draft_id" ]] && { __log "Draft ID required: preprint paper publish <draftId> -d hexagon" -t error -l preprint; return 1; }
 
         local base_url token
         base_url="$(__preprint_hexagon_base_url)"
@@ -702,7 +917,7 @@ __hexagon__() {
 
     __preprint_provider_hexagon_rm() {
         local draft_id="${1#hexagon:}"
-        [[ -z "$draft_id" ]] && { __log "Draft ID required to cancel/remove from Hexagon Math." -t error -l preprint; return 1; }
+        [[ -z "$draft_id" ]] && { __log "Paper/Draft ID required to drop from Hexagon Math." -t error -l preprint; return 1; }
 
         local base_url token
         base_url="$(__preprint_hexagon_base_url)"
@@ -722,10 +937,10 @@ __hexagon__() {
         body="${resp%$'\n'*}"
 
         if [[ "$http_code" =~ ^20[024]$ ]]; then
-            __log "Cancelled and removed draft '$draft_id' from Hexagon Math." -t success -l preprint
+            __log "Cancelled and dropped '$draft_id' from Hexagon Math." -t success -l preprint
             return 0
         else
-            __log "Failed to cancel '$draft_id' on Hexagon Math (HTTP $http_code)." -t error -l preprint
+            __log "Failed to drop '$draft_id' on Hexagon Math (HTTP $http_code)." -t error -l preprint
             echo "$body" >&2
             return 1
         fi

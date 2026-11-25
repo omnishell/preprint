@@ -5,7 +5,7 @@ __arxiv__() {
         --pagination "offset" \
         --requires-file "true" \
         --requires-category "true" \
-        --desc "arXiv.org e-Print archive (Atom API & SWORD deposit)"
+        --desc "arXiv.org e-Print archive (Atom API & SWORD deposit / version replacement)"
 
     __preprint_parse_arxiv_atom() {
         local mode="${1:-compact}"
@@ -17,7 +17,7 @@ __arxiv__() {
             BEGIN { in_entry = 0; count = 0 }
             /<entry>/ {
                 in_entry = 1
-                id = ""; title = ""; pub = ""; upd = ""; summary = ""; authors = ""
+                id = ""; title = ""; pub = ""; upd = ""; summary = ""; authors = ""; cat = ""; comment = ""
                 in_title = 0; in_sum = 0
                 next
             }
@@ -36,9 +36,9 @@ __arxiv__() {
                 pub_short = (date_val != "" ? substr(date_val, 1, 10) : "N/A")
                 if (authors == "") authors = "Unknown Author"
                 if (mode == "detailed") {
-                    printf "ID:        %s\nTitle:     %s\nPublished: %s\nAuthors:   %s\nURL:       https://arxiv.org/abs/%s\nPDF:       https://arxiv.org/pdf/%s.pdf\nAbstract:\n  %s\n", id, title, pub_short, authors, id, id, summary
+                    printf "ID:        %s\nStatus:    PUBLISHED\nTitle:     %s\nPublished: %s\nAuthors:   %s\nCategory:  %s\nComments:  %s\nURL:       https://arxiv.org/abs/%s\nPDF:       https://arxiv.org/pdf/%s.pdf\nAbstract:\n  %s\n", id, title, pub_short, authors, (cat ? cat : "N/A"), (comment ? comment : "-"), id, id, summary
                 } else {
-                    printf "[%s] (%s) %s   %s\n", id, pub_short, title, authors
+                    printf "[%s] (%s) [PUBLISHED] %s   %s\n", id, pub_short, title, authors
                 }
                 next
             }
@@ -54,6 +54,14 @@ __arxiv__() {
                 if ($0 ~ /<updated>.*<\/updated>/) {
                     s = $0; sub(/^.*<updated>/, "", s); sub(/<\/updated>.*$/, "", s)
                     upd = s
+                }
+                if ($0 ~ /<arxiv:primary_category[^>]*term="[^"]+"/) {
+                    s = $0; sub(/^.*term="/, "", s); sub(/".*$/, "", s)
+                    if (cat == "") cat = s
+                }
+                if ($0 ~ /<arxiv:comment[^>]*>.*<\/arxiv:comment>/) {
+                    s = $0; sub(/^.*<arxiv:comment[^>]*>/, "", s); sub(/<\/arxiv:comment>.*$/, "", s)
+                    comment = strip_entities(s)
                 }
                 if ($0 ~ /<(name|dc:creator)>.*<\/(name|dc:creator)>/) {
                     s = $0
@@ -191,7 +199,7 @@ __arxiv__() {
                 }
             ' <<< "$dashboard_html")
             if [[ -n "$detected_pid" ]]; then
-                __preprint_conf set -d arxiv --profile "$detected_pid" >/dev/null 2>&1
+                __preprint_conf_set -d arxiv --profile "$detected_pid" >/dev/null 2>&1
                 local feed
                 feed=$(curl -fsSL "https://arxiv.org/a/${detected_pid}.atom2" 2>/dev/null)
                 if [[ "$feed" == *"<entry>"* ]]; then
@@ -225,9 +233,9 @@ __arxiv__() {
         fi
 
         __log "Could not resolve arXiv profile entries. Set your arXiv Author ID or ORCID iD via:
-  preprint conf set arxiv --profile <author_id>
+  preprint db set arxiv --profile <author_id>
   OR
-  preprint conf set arxiv --orcid <0000-0000-0000-0000>" -t error -l preprint
+  preprint db set arxiv --orcid <0000-0000-0000-0000>" -t error -l preprint
         return 1
     }
 
@@ -261,9 +269,13 @@ __arxiv__() {
         curl -sSL "https://export.arxiv.org/api/query?search_query=${query_str}&sortBy=submittedDate&sortOrder=${arxiv_order}&start=${start}&max_results=${max}" | __preprint_parse_arxiv_atom "compact" || echo "No entries found."
     }
 
-    __preprint_provider_arxiv_send() {
+    __preprint_arxiv_sword_submit() {
+        local replace_id="${1:-}"
         local file="$PREPRINT_SEND_FILE" meta="$PREPRINT_SEND_META" title="$PREPRINT_SEND_TITLE"
         local author="$PREPRINT_SEND_AUTHOR" abstract="$PREPRINT_SEND_ABSTRACT" category="$PREPRINT_SEND_CATEGORY"
+        local comments="${PREPRINT_SEND_COMMENTS:-}" doi="${PREPRINT_SEND_DOI:-}" journal="${PREPRINT_SEND_JOURNAL:-}"
+        local msc="${PREPRINT_SEND_MSC:-}"
+
         local user pass token
         user="${ARXIV_USER:-$(__preprint_get_conf arxiv user)}"
         pass="${ARXIV_PASS:-$(__preprint_get_conf arxiv pass)}"
@@ -275,30 +287,120 @@ __arxiv__() {
         elif [[ -n "$user" && -n "$pass" ]]; then
             auth_args=(-u "${user}:${pass}")
         else
-            __log "arXiv credentials missing. Run: preprint conf set arxiv --user <user> --pass <pass> (or --token <token>)" -t error -l preprint
+            __log "arXiv credentials missing. Run: preprint db set arxiv --user <user> --pass <pass> (or --token <token>)" -t error -l preprint
             return 1
         fi
 
-        local tmp_dir="" upload_zip="$file"
-        if [[ "$file" != *.zip ]]; then
-            tmp_dir="$(mktemp -d)"
-            upload_zip="$tmp_dir/arxiv_submission.zip"
+        local tmp_dir="$(mktemp -d)"
+        local media_zip="$tmp_dir/media_files.zip"
+        if [[ -d "$file" ]]; then
+            (cd "$file" && zip -qr "$media_zip" . -x "*.git*" "*.aux" "*.log" "*.out")
+        elif [[ "$file" == *.zip ]]; then
+            cp "$file" "$media_zip"
+        else
+            cp "$file" "$tmp_dir/"
+            (cd "$tmp_dir" && zip -qr "$media_zip" "$(basename "$file")")
+        fi
 
+        local extra_arxiv_xml=""
+        [[ -n "$comments" ]] && extra_arxiv_xml+="  <arxiv:comment>$(__preprint_xml_escape "$comments")</arxiv:comment>"$'\n'
+        [[ -n "$doi" ]]      && extra_arxiv_xml+="  <arxiv:doi>$(__preprint_xml_escape "$doi")</arxiv:doi>"$'\n'
+        [[ -n "$journal" ]]  && extra_arxiv_xml+="  <arxiv:journal_ref>$(__preprint_xml_escape "$journal")</arxiv:journal_ref>"$'\n'
+        [[ -n "$msc" ]]      && extra_arxiv_xml+="  <arxiv:msc_class>$(__preprint_xml_escape "$msc")</arxiv:msc_class>"$'\n'
+
+        local esc_title esc_abs esc_cat authors_xml=""
+        esc_title=$(__preprint_xml_escape "$title")
+        esc_abs=$(__preprint_xml_escape "$abstract")
+        esc_cat=$(__preprint_xml_escape "$category")
+
+        local IFS=';' a
+        for a in $author; do
+            a="${a#"${a%%[![:space:]]*}"}"
+            a="${a%"${a##*[![:space:]]}"}"
+            [[ -z "$a" ]] && continue
+            authors_xml+="  <author><name>$(__preprint_xml_escape "$a")</name></author>"$'\n'
+        done
+
+        # A. REPLACEMENT FLOW ('preprint paper update' / 'preprint paper send -u <id>'):
+        # 1) Deposit updated media ZIP to SWORD collection to obtain edit-media link
+        # 2) PUT Atom wrapper referencing that media resource to /sword-app/edit/<id>
+        if [[ -n "$replace_id" ]]; then
+            local clean_id="${replace_id#arXiv:}"
+            clean_id="${clean_id%v[0-9]*}"
+            local col_url="https://arxiv.org/sword-app/${category}"
+
+            __log "Step 1/2: Uploading replacement media archive to arXiv SWORD ($col_url)..." -t info -l preprint
+            local m_resp m_code m_body media_href=""
+            m_resp=$(curl -sS -w "\n%{http_code}" "${auth_args[@]}" \
+                -H "Content-Type: application/zip" \
+                -H "Content-Disposition: filename=$(basename "$media_zip")" \
+                --data-binary @"$media_zip" \
+                "$col_url" 2>&1)
+            m_code="${m_resp##*$'\n'}"
+            m_body="${m_resp%$'\n'*}"
+
+            if [[ "$m_code" =~ ^20[012]$ ]]; then
+                media_href=$(LC_ALL=C awk 'match($0, /rel="edit-media"[^>]*href="[^"]+"/) { s = substr($0, RSTART, RLENGTH); sub(/^.*href="/, "", s); sub(/"$/, "", s); print s; exit }' <<< "$m_body")
+            fi
+
+            local wrapper_xml="$tmp_dir/wrapper.xml"
             if __preprint_is_raw_payload_meta "$meta"; then
-                cp "$meta" "$tmp_dir/atom.xml"
+                cp "$meta" "$wrapper_xml"
             else
-                local esc_title esc_abs esc_cat authors_xml=""
-                esc_title=$(__preprint_xml_escape "$title")
-                esc_abs=$(__preprint_xml_escape "$abstract")
-                esc_cat=$(__preprint_xml_escape "$category")
-                local IFS=';' a
-                for a in $author; do
-                    a="${a#"${a%%[![:space:]]*}"}"
-                    a="${a%"${a##*[![:space:]]}"}"
-                    [[ -z "$a" ]] && continue
-                    authors_xml+="  <author><name>$(__preprint_xml_escape "$a")</name></author>"$'\n'
-                done
-                cat > "$tmp_dir/atom.xml" <<EOF
+                local link_tag=""
+                [[ -n "$media_href" ]] && link_tag="  <link rel=\"related\" href=\"$(__preprint_xml_escape "$media_href")\" type=\"application/zip\" />"
+                cat > "$wrapper_xml" <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<entry xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <title>${esc_title}</title>
+  <summary>${esc_abs}</summary>
+${authors_xml%$'\n'}
+  <arxiv:primary_category term="${esc_cat}" />
+${extra_arxiv_xml}${link_tag}
+</entry>
+EOF
+            fi
+
+            local edit_url="https://arxiv.org/sword-app/edit/${clean_id}"
+            __log "Step 2/2: Submitting replacement wrapper via PUT to '$edit_url'..." -t info -l preprint
+            local resp http_code body
+            if [[ -n "$media_href" ]]; then
+                resp=$(curl -sS -w "\n%{http_code}" -X PUT "${auth_args[@]}" \
+                    -H "Content-Type: application/atom+xml;type=entry" \
+                    --data-binary @"$wrapper_xml" \
+                    "$edit_url" 2>&1)
+            else
+                # Direct SimpleZip fallback if collection endpoint requires single-package replacement
+                cp "$wrapper_xml" "$tmp_dir/atom.xml"
+                local full_zip="$tmp_dir/arxiv_replacement.zip"
+                (cd "$tmp_dir" && zip -qr "$full_zip" . -x "media_files.zip" "wrapper.xml" "arxiv_replacement.zip")
+                resp=$(curl -sS -w "\n%{http_code}" -X PUT "${auth_args[@]}" \
+                    -H "Content-Type: application/zip" \
+                    -H "Packaging: http://purl.org/net/sword/package/SimpleZip" \
+                    --data-binary @"$full_zip" \
+                    "$edit_url" 2>&1)
+            fi
+
+            rm -rf "$tmp_dir"
+            http_code="${resp##*$'\n'}"
+            body="${resp%$'\n'*}"
+            if [[ "$http_code" =~ ^20[012]$ ]]; then
+                __log "arXiv version replacement for '$clean_id' succeeded (HTTP $http_code)." -t success -l preprint
+                echo "$body"
+                return 0
+            else
+                __log "arXiv version replacement for '$clean_id' failed (HTTP $http_code)." -t error -l preprint
+                echo "$body" >&2
+                return 1
+            fi
+        fi
+
+        # B. NEW DEPOSIT FLOW ('preprint paper send')
+        local upload_zip="$tmp_dir/arxiv_submission.zip"
+        if __preprint_is_raw_payload_meta "$meta"; then
+            cp "$meta" "$tmp_dir/atom.xml"
+        else
+            cat > "$tmp_dir/atom.xml" <<EOF
 <?xml version="1.0" encoding="utf-8"?>
 <entry xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
   <title>${esc_title}</title>
@@ -306,12 +408,18 @@ __arxiv__() {
 ${authors_xml%$'\n'}
   <arxiv:primary_category term="${esc_cat}" />
   <category term="${esc_cat}" scheme="http://arxiv.org/schemas/atom" />
+${extra_arxiv_xml%$'\n'}
 </entry>
 EOF
-            fi
-            cp -r "$file" "$tmp_dir/"
-            (cd "$tmp_dir" && zip -qr "$upload_zip" .)
         fi
+
+        rm -f "$media_zip"
+        if [[ -d "$file" ]]; then
+            cp -r "$file"/. "$tmp_dir/"
+        elif [[ "$file" == *.zip ]]; then
+            unzip -q "$file" -d "$tmp_dir"
+        fi
+        (cd "$tmp_dir" && zip -qr "$upload_zip" . -x "arxiv_submission.zip" "*.git*" "*.aux" "*.log" "*.out")
 
         __log "Submitting package '$upload_zip' to arXiv SWORD API..." -t info -l preprint
         local resp http_code
@@ -322,7 +430,7 @@ EOF
             --data-binary @"$upload_zip" \
             "https://arxiv.org/sword-app/deposit" 2>&1)
 
-        [[ -n "$tmp_dir" ]] && rm -rf "$tmp_dir"
+        rm -rf "$tmp_dir"
         http_code="${resp##*$'\n'}"
         local body="${resp%$'\n'*}"
         if [[ "$http_code" =~ ^20[012]$ ]]; then
@@ -333,5 +441,14 @@ EOF
             echo "$body" >&2
             return 1
         fi
+    }
+
+    __preprint_provider_arxiv_send() {
+        __preprint_arxiv_sword_submit ""
+    }
+
+    __preprint_provider_arxiv_update() {
+        local target_id="$1"
+        __preprint_arxiv_sword_submit "$target_id"
     }
 }

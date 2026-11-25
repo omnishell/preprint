@@ -16,54 +16,55 @@ ABOUT:
     omni academic preprint & publication manager
 
 USAGE:
-    preprint conf <ls|get|set|rm> [<provider>] [options]
-    preprint ls <provider> [-s/--sort <time|alpha>] [-r/--reverse] [-n/--max <N>]
-    preprint search <terms...> [-d/--database] <provider> [-D/--download] [-o/--output <path>] [-s/--sort <time|alpha>] [-r/--reverse] [-n/--max <page_size>] [--no-fzf]
-    preprint get [<id>] -d/--database <provider> [-D/--download] [-o/--output <path>] [-s/--sort <time|alpha>] [-r/--reverse]
-    preprint download [<id>] -d/--database <provider> [-o/--output <path>]
-    preprint send [<file>] [metadata-options] -d/--database <provider>
-    preprint publish [<id>] -d/--database <provider>
-    preprint rm [<id>] -d/--database <provider>
+    preprint <database|db> <ls|set|get|rm|sync|search> [options]
+    preprint paper <ls|send|update|publish|drop|get|download> [options]
 
 REGISTERED PROVIDERS:
     ${dbs_csv}
 $(__preprint_providers_help_table)
 
-CONFIGURATION COMMANDS ('preprint conf'):
-    conf ls                        List registered providers and status
-    conf get <provider>            Inspect configuration & credentials for <provider>
-    conf set <provider> [options]  Configure profile ID & credentials (interactive or via flags)
-    conf rm <provider>             Remove stored configuration for <provider>
+DATABASE COMMANDS ('preprint database' | 'preprint db'):
+    db ls                          List registered databases and configuration status
+    db set <provider> [options]    Configure profile ID & credentials (interactive or via flags)
+    db get [<provider>]            Inspect configuration & credentials for <provider>
+    db rm <provider>               Remove stored configuration & cache for <provider>
+    db sync [<provider>|--all]     Sync remote profile papers into local cache
+    db search <terms...> -d <prov> Search papers in <provider> (-D to download, --no-fzf for plain output)
 
-ENTRY & PUBLICATION COMMANDS:
-    ls <provider> [options]        List publications & [DRAFT] entries in your profile
-    send [<file>] -d <provider>    Stage a draft deposit or add a work entry to your profile
-    publish [<id>] -d <provider>   Publish a [DRAFT] entry (omit <id> to pick interactively via fzf)
-    rm [<id>] -d <provider>        Remove/delete a work or [DRAFT] entry from your profile
-    get [<id>] -d <provider>       Inspect entry metadata (omit <id> to pick from profile via fzf)
-    download [<id>] -d <provider>  Download entry PDF (alias: 'dl')
+PAPER COMMANDS ('preprint paper'):
+    paper ls [<prov>] [-s/--sync]  List [PUBLISHED] & [DRAFT] papers (-S/--sort <time|alpha>, -r, -n <N>)
+    paper send [<file>] -d <prov>  Send/stage a paper (-p/--publish to publish immediately, -u/--update [<id>] for new version)
+    paper update [<id>] [<file>] -d <prov>
+                                   Submit a new version of an existing paper (-p/--publish, --comments <text>)
+    paper publish [<id>] -d <prov> Publish a staged [DRAFT] paper (omit <id> to pick via fzf)
+    paper drop [<id>] -d <prov>    Remove/cancel a paper or [DRAFT] from <provider>
+    paper get [<id>] -d <prov>     Inspect paper/draft metadata (-D/--download, -o/--output <path>)
+    paper download [<id>] -d <prov> Download paper PDF (alias: 'dl')
 
-OPTIONS (for 'conf set'):
+DATABASE SET OPTIONS ('preprint db set'):
     -d, --database <prov>   Target provider (${dbs_csv})
-    --profile <id>          Profile ID (Author ID, idHAL, ORCID iD, Scholar ID, S2 ID, OpenAlex ID, DBLP PID)
-    --orcid <id>            ORCID iD (e.g., 0000-0002-1825-0097)
+    --profile <id>          Profile ID (Author ID, idHAL, ORCID iD, Scholar ID, OpenAlex ID, DBLP PID)
+    --orcid <id>            ORCID iD (e.g., 0000-0003-3717-6774)
     --token <token>         API Token / OAuth Bearer token / API Key
     --user <user>           Account username/email
     --pass <pass>           Account password
     --sandbox               Use sandbox/preprod API endpoints
     --no-sandbox            Use production API endpoints (default)
 
-METADATA OPTIONS (for 'send'):
+PAPER SEND / UPDATE OPTIONS ('preprint paper send' | 'preprint paper update'):
     -d, --database <prov>   Target provider (${dbs_csv})
+    -p, --publish           Immediately publish/commit after staging draft
+    -u, --update [<id>]     Submit as a new version of existing paper <id> (omit <id> to pick via fzf)
+    --comments <text>       Version changelog / author comments (e.g., "Fixed proof of Theorem 2")
     -m, --meta <file>       Custom metadata file (YAML/Key-Value, JSON, or XML)
     -t, --title <title>     Title of the paper/work (auto-extracted if <file> is .tex)
     -a, --author <authors>  Authors separated by ';' (auto-extracted if <file> is .tex)
     -A, --abstract <text>   Abstract or short description (auto-extracted if <file> is .tex)
-    -c, --category <cat>    Domain/Category (e.g., "math-ph", "math.DG", "cs.AI", "info.info-ai")
+    -c, --category <cat>    Domain/Category (e.g., "math-ph", "math.CT", "cs.LO")
     --msc <codes>           MSC2020 codes separated by ',' or ';' (auto-extracted from \subjclass in .tex)
     --keywords <list>       Keywords separated by ';' (auto-extracted from \keywords in .tex)
     --doi <doi>             DOI identifier (e.g., "10.1234/example.2026")
-    --id <provider:id>      External identifier (repeatable, e.g., --id arxiv:2301.00001)
+    --id <provider:id>      External identifier (repeatable, e.g., --id arxiv:2611.00001)
     --url <url>             Work URL
     --journal <name>        Journal or host venue title
     --type <type>           Work type (default: "preprint"; e.g., "journal-article")
@@ -72,44 +73,112 @@ METADATA OPTIONS (for 'send'):
 EOF
     }
 
+    __preprint_db_dispatch() {
+        local sub="${1:-ls}"
+        if [[ "$sub" == "-h" || "$sub" == "--help" ]]; then
+            __preprint__.__help__
+            return 0
+        fi
+        shift || true
+
+        case "$sub" in
+            ls|list)
+                __preprint_conf_ls "$@"
+                ;;
+            set|edit|new)
+                __preprint_conf_set "$@"
+                ;;
+            get|show)
+                __preprint_conf_get "$@"
+                ;;
+            rm|remove|del|delete|drop)
+                __preprint_conf_rm "$@"
+                ;;
+            sync|refresh)
+                __preprint_sync "$@"
+                ;;
+            search|find|query)
+                __preprint_search "$@"
+                ;;
+            *)
+                if __preprint_is_provider "$sub"; then
+                    __preprint_conf_get "$sub" "$@"
+                else
+                    __log "Unknown database command '$sub'. Use: preprint db <ls|set|get|rm|sync|search>" -t error -l preprint
+                    return 1
+                fi
+                ;;
+        esac
+    }
+
+    __preprint_paper_dispatch() {
+        local sub="${1:-ls}"
+        if [[ "$sub" == "-h" || "$sub" == "--help" ]]; then
+            __preprint__.__help__
+            return 0
+        fi
+        shift || true
+
+        case "$sub" in
+            ls|list)
+                __preprint_paper_ls "$@"
+                ;;
+            send|push|add)
+                __preprint_paper_send "$@"
+                ;;
+            update|revise|upgrade)
+                __preprint_paper_update "$@"
+                ;;
+            publish|commit)
+                __preprint_paper_publish "$@"
+                ;;
+            drop|rm|remove|del|delete)
+                __preprint_paper_drop "$@"
+                ;;
+            get|show|info)
+                __preprint_paper_get "$@"
+                ;;
+            download|dl)
+                __preprint_paper_get -D "$@"
+                ;;
+            *)
+                if __preprint_is_provider "$sub"; then
+                    __preprint_paper_ls "$sub" "$@"
+                else
+                    __log "Unknown paper command '$sub'. Use: preprint paper <ls|send|update|publish|drop|get|download>" -t error -l preprint
+                    return 1
+                fi
+                ;;
+        esac
+    }
+
     preprint() {
-        local cmd="${1:-}"
-        if [[ -z "$cmd" || "$cmd" == "-h" || "$cmd" == "--help" ]]; then
+        local obj="${1:-}"
+        if [[ -z "$obj" || "$obj" == "-h" || "$obj" == "--help" ]]; then
             __preprint__.__help__
             return 0
         fi
         shift
 
-        case "$cmd" in
-            conf|config|database|db)
-                __preprint_conf "$@"
+        case "$obj" in
+            database|db|conf|config)
+                __preprint_db_dispatch "$@"
                 ;;
-            ls|list)
-                __preprint_list "$@"
+            paper|papers|work|works)
+                __preprint_paper_dispatch "$@"
                 ;;
-            get)
-                __preprint_get "$@"
-                ;;
-            search)
-                __preprint_search "$@"
-                ;;
-            download|dl)
-                __preprint_get -D "$@"
-                ;;
-            send|push|add)
-                __preprint_send "$@"
-                ;;
-            publish)
-                __preprint_publish "$@"
-                ;;
-            rm|remove|del|delete)
-                __preprint_rm "$@"
-                ;;
-            profile)
-                __preprint_profile_legacy "$@"
-                ;;
+            # Convenience top-level fallbacks so legacy invocations still work seamlessly
+            ls|list)            __preprint_paper_ls "$@" ;;
+            sync)               __preprint_sync "$@" ;;
+            search)             __preprint_search "$@" ;;
+            get)                __preprint_paper_get "$@" ;;
+            download|dl)        __preprint_paper_get -D "$@" ;;
+            send|push)          __preprint_paper_send "$@" ;;
+            update|revise)      __preprint_paper_update "$@" ;;
+            publish)            __preprint_paper_publish "$@" ;;
+            drop|rm)            __preprint_paper_drop "$@" ;;
             *)
-                __log "Unknown command '$cmd'. Try 'preprint --help'." -t error -l preprint
+                __log "Unknown object '$obj'. Use 'preprint db ...' or 'preprint paper ...' (see 'preprint --help')." -t error -l preprint
                 return 1
                 ;;
         esac
@@ -118,13 +187,13 @@ EOF
     __preprint__.__compl__() {
         local cur="${COMP_WORDS[COMP_CWORD]:-}"
         local prev="${COMP_WORDS[COMP_CWORD-1]:-}"
-        local cmd="${COMP_WORDS[1]:-}"
-        local subcmd="${COMP_WORDS[2]:-}"
+        local obj="${COMP_WORDS[1]:-}"
+        local sub="${COMP_WORDS[2]:-}"
         local dbs="${PREPRINT_PROVIDERS[*]}"
-        local meta_flags="-d --database -m --meta -t --title -a --author -A --abstract -c --category --msc --keywords --doi --id --url --journal --type --date -y --yes"
+        local send_flags="-d --database -p --publish -u --update --comments -m --meta -t --title -a --author -A --abstract -c --category --msc --keywords --doi --id --url --journal --type --date -y --yes"
 
         if [[ $COMP_CWORD -eq 1 ]]; then
-            COMPREPLY=( $(compgen -W "conf ls search get download send publish rm --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "db database paper --help -h" -- "$cur") )
             return 0
         fi
 
@@ -132,8 +201,8 @@ EOF
             COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
             return 0
         fi
-        if [[ "$prev" == "-s" || "$prev" == "--sort" ]]; then
-            COMPREPLY=( $(compgen -W "time alpha alphabetically" -- "$cur") )
+        if [[ "$prev" == "-S" || "$prev" == "--sort" ]]; then
+            COMPREPLY=( $(compgen -W "time alpha" -- "$cur") )
             return 0
         fi
         if [[ "$prev" == "-m" || "$prev" == "--meta" || "$prev" == "-o" || "$prev" == "--output" ]]; then
@@ -141,52 +210,80 @@ EOF
             return 0
         fi
 
-        case "$cmd" in
-            conf|config)
+        case "$obj" in
+            db|database|conf|config)
                 if [[ $COMP_CWORD -eq 2 ]]; then
-                    COMPREPLY=( $(compgen -W "ls get set edit rm" -- "$cur") )
-                elif [[ "$cur" == -* ]]; then
-                    if [[ "$subcmd" == "set" || "$subcmd" == "edit" ]]; then
-                        COMPREPLY=( $(compgen -W "-d --database --profile --orcid --token --user --pass --sandbox --no-sandbox" -- "$cur") )
-                    elif [[ "$subcmd" == "rm" || "$subcmd" == "get" ]]; then
-                        COMPREPLY=( $(compgen -W "-d --database" -- "$cur") )
-                    fi
-                elif [[ $COMP_CWORD -eq 3 && ( "$subcmd" == "set" || "$subcmd" == "edit" || "$subcmd" == "get" || "$subcmd" == "rm" ) ]]; then
-                    COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
+                    COMPREPLY=( $(compgen -W "ls set get rm sync search" -- "$cur") )
+                    return 0
                 fi
+                case "$sub" in
+                    set|edit)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=( $(compgen -W "-d --database --profile --orcid --token --user --pass --sandbox --no-sandbox" -- "$cur") )
+                        elif [[ $COMP_CWORD -eq 3 ]]; then
+                            COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
+                        fi
+                        ;;
+                    get|rm)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=( $(compgen -W "-d --database" -- "$cur") )
+                        elif [[ $COMP_CWORD -eq 3 ]]; then
+                            COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
+                        fi
+                        ;;
+                    sync)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=( $(compgen -W "-d --database --all -a" -- "$cur") )
+                        elif [[ $COMP_CWORD -eq 3 ]]; then
+                            COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
+                        fi
+                        ;;
+                    search)
+                        if [[ "$prev" == "-s" ]]; then
+                            COMPREPLY=( $(compgen -W "time alpha" -- "$cur") )
+                        elif [[ "$cur" == -* ]]; then
+                            COMPREPLY=( $(compgen -W "-d --database -D --download -o --output -s -S --sort -r --reverse -n --max --no-fzf" -- "$cur") )
+                        elif [[ $COMP_CWORD -gt 3 ]]; then
+                            COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
+                        fi
+                        ;;
+                esac
                 ;;
-            ls|list)
-                if [[ "$cur" == -* ]]; then
-                    COMPREPLY=( $(compgen -W "-d --database -s --sort -r --reverse -n --max" -- "$cur") )
-                elif [[ $COMP_CWORD -eq 2 ]]; then
-                    COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
+            paper|papers|work|works)
+                if [[ $COMP_CWORD -eq 2 ]]; then
+                    COMPREPLY=( $(compgen -W "ls send update publish drop get download" -- "$cur") )
+                    return 0
                 fi
-                ;;
-            get|download|dl)
-                if [[ "$cur" == -* ]]; then
-                    COMPREPLY=( $(compgen -W "-d --database -D --download -o --output -s --sort -r --reverse -n --max" -- "$cur") )
-                fi
-                ;;
-            search)
-                if [[ "$cur" == -* ]]; then
-                    COMPREPLY=( $(compgen -W "-d --database -D --download -o --output -s --sort -r --reverse -n --max -l --no-fzf" -- "$cur") )
-                elif [[ $COMP_CWORD -gt 2 ]]; then
-                    COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
-                fi
-                ;;
-            send|push|add)
-                if [[ "$cur" == -* ]]; then
-                    COMPREPLY=( $(compgen -W "$meta_flags" -- "$cur") )
-                else
-                    COMPREPLY=( $(compgen -f -- "$cur") )
-                fi
-                ;;
-            publish|rm|remove|del|delete)
-                if [[ "$cur" == -* ]]; then
-                    COMPREPLY=( $(compgen -W "-d --database" -- "$cur") )
-                elif [[ $COMP_CWORD -eq 2 ]]; then
-                    COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
-                fi
+                case "$sub" in
+                    ls|list)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=( $(compgen -W "-d --database -s --sync -S --sort -r --reverse -n --max" -- "$cur") )
+                        elif [[ $COMP_CWORD -eq 3 ]]; then
+                            COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
+                        fi
+                        ;;
+                    send|push|add|update|revise)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=( $(compgen -W "$send_flags" -- "$cur") )
+                        else
+                            COMPREPLY=( $(compgen -f -- "$cur") )
+                        fi
+                        ;;
+                    publish|drop|rm)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=( $(compgen -W "-d --database" -- "$cur") )
+                        elif [[ $COMP_CWORD -eq 3 ]]; then
+                            COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
+                        fi
+                        ;;
+                    get|download|dl)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=( $(compgen -W "-d --database -D --download -o --output -S --sort -r --reverse -n --max" -- "$cur") )
+                        elif [[ $COMP_CWORD -eq 3 ]]; then
+                            COMPREPLY=( $(compgen -W "$dbs" -- "$cur") )
+                        fi
+                        ;;
+                esac
                 ;;
         esac
     }
