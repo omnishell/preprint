@@ -54,8 +54,8 @@ __hexagon__() {
     }
 
     __preprint_parse_hexagon() {
-        local mode="${1:-compact}" base_url="${2:-https://hexagonmath.org}"
-        LC_ALL=C awk -v mode="$mode" -v base_url="$base_url" '
+        local mode="${1:-compact}" base_url="${2:-https://hexagonmath.org}" filter_str="${3:-}"
+        LC_ALL=C awk -v mode="$mode" -v base_url="$base_url" -v filter_str="$filter_str" '
             function unesc_json(s) {
                 gsub(/\\"/, "\"", s); gsub(/\\\\/, "\\", s)
                 gsub(/\\n/, " ", s); gsub(/\\r/, "", s); gsub(/\\t/, " ", s)
@@ -194,6 +194,17 @@ __hexagon__() {
                 }
                 return n
             }
+            function matches_filter(chunk, authors, title,    n, i, terms, t, hay) {
+                if (filter_str == "") return 1
+                hay = tolower(chunk "\n" authors "\n" title)
+                n = split(tolower(filter_str), terms, "|")
+                for (i = 1; i <= n; i++) {
+                    t = terms[i]
+                    gsub(/^[ \t]+|[ \t]+$/, "", t)
+                    if (t != "" && index(hay, t) > 0) return 1
+                }
+                return 0
+            }
             { raw = raw $0 "\n" }
             END {
                 if (mode == "extract_draft_id") {
@@ -259,10 +270,11 @@ __hexagon__() {
                         if (base_id in seen) continue
                         title = get_json_str(chunk, "title")
                         if (title == "") continue
-                        seen[base_id] = 1
-                        pub = get_json_date(chunk, id)
                         authors = get_json_authors(chunk)
                         if (authors == "") authors = "Unknown Contributor"
+                        if (!matches_filter(chunk, authors, title)) continue
+                        seen[base_id] = 1
+                        pub = get_json_date(chunk, id)
                         badge = (is_json_draft(chunk) ? "[DRAFT] " : "")
                         printf "[%s] (%s) %s%s   %s\n", id, pub, badge, title, authors
                         count++
@@ -305,40 +317,41 @@ __hexagon__() {
 
     __preprint_provider_hexagon_list() {
         local max="${1:-0}" sort_by="${2:-time}" reverse="${3:-0}"
-        local limit=$(( max > 0 ? max : 100 ))
-        local base_url profile orcid token
+        local limit=$(( max > 0 ? max : 200 ))
+        local base_url profile orcid
         base_url="$(__preprint_hexagon_base_url)"
         profile="${HEXAGON_PROFILE:-$(__preprint_get_conf hexagon profile)}"
         [[ -z "$profile" ]] && profile="$(__preprint_get_conf hexagon author)"
         [[ -z "$profile" ]] && profile="$(__preprint_get_conf hexagon user)"
         orcid="${HEXAGON_ORCID:-$(__preprint_get_conf hexagon orcid)}"
         [[ -z "$orcid" ]] && orcid="$(__preprint_get_conf orcid orcid)"
-        token="${HEXAGON_TOKEN:-$(__preprint_get_conf hexagon token)}"
 
-        local resp out="" sub_out="" work_out=""
-
-        if [[ -n "$token" ]]; then
-            resp=$(curl -fsSL -H "Authorization: Bearer $token" -H "Accept: application/json" "${base_url}/api/v1/submissions?limit=${limit}" 2>/dev/null)
-            [[ -n "$resp" ]] && sub_out=$(__preprint_parse_hexagon "compact" "$base_url" <<< "$resp" 2>/dev/null)
+        # If profile is not set but ORCID is, resolve the researcher's name from ORCID
+        local orcid_name=""
+        if [[ -z "$profile" && -n "$orcid" ]]; then
+            orcid_name=$(curl -fsSL -H "Accept: application/vnd.orcid+xml" "https://pub.orcid.org/v3.0/${orcid}/person" 2>/dev/null | LC_ALL=C awk '
+                function strip_tag(s) { gsub(/<[^>]+>/, "", s); gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s); return s }
+                /<personal-details:given-names>/  { gn = strip_tag($0) }
+                /<personal-details:family-names>/ { fn = strip_tag($0) }
+                /<personal-details:credit-name>/  { cn = strip_tag($0) }
+                END {
+                    if (cn != "") print cn
+                    else if (gn != "" || fn != "") print gn (gn && fn ? " " : "") fn
+                }
+            ')
         fi
 
-        if [[ -n "$profile" ]]; then
-            local enc_prof=$(__preprint_urlencode "${profile:0:48}")
-            resp=$(curl -fsSL -H "Accept: application/json" "${base_url}/api/v1/works?author=${enc_prof}&limit=${limit}" 2>/dev/null)
-            [[ -n "$resp" ]] && work_out=$(__preprint_parse_hexagon "compact" "$base_url" <<< "$resp" 2>/dev/null)
-            if [[ -z "$work_out" ]]; then
-                resp=$(curl -fsSL -H "Accept: application/json" "${base_url}/api/v1/works?q=${enc_prof}&limit=${limit}" 2>/dev/null)
-                [[ -n "$resp" ]] && work_out=$(__preprint_parse_hexagon "compact" "$base_url" <<< "$resp" 2>/dev/null)
-            fi
+        local filter_terms=""
+        [[ -n "$profile" ]]    && filter_terms+="${filter_terms:+|}${profile}"
+        [[ -n "$orcid" ]]      && filter_terms+="${filter_terms:+|}${orcid}"
+        [[ -n "$orcid_name" ]] && filter_terms+="${filter_terms:+|}${orcid_name}"
+
+        local resp out=""
+        resp=$(curl -fsSL -H "Accept: application/json" "${base_url}/api/v1/works?limit=${limit}" 2>/dev/null)
+        if [[ -n "$resp" ]]; then
+            out=$(__preprint_parse_hexagon "compact" "$base_url" "$filter_terms" <<< "$resp" 2>/dev/null)
         fi
 
-        if [[ -z "$work_out" && -n "$orcid" ]]; then
-            local enc_orcid=$(__preprint_urlencode "${orcid:0:48}")
-            resp=$(curl -fsSL -H "Accept: application/json" "${base_url}/api/v1/works?q=${enc_orcid}&limit=${limit}" 2>/dev/null)
-            [[ -n "$resp" ]] && work_out=$(__preprint_parse_hexagon "compact" "$base_url" <<< "$resp" 2>/dev/null)
-        fi
-
-        out="${sub_out}${sub_out:+$'\n'}${work_out}"
         if [[ -n "$out" ]]; then
             (( max > 0 )) && head -n "$max" <<< "$out" || echo "$out"
             return 0
@@ -390,7 +403,7 @@ __hexagon__() {
         local resp out=""
 
         resp=$(curl -fsSL -H "Accept: application/json" "${base_url}/api/v1/works?q=${enc_term}&limit=${limit}" 2>/dev/null)
-        [[ -n "$resp" ]] && out=$(__preprint_parse_hexagon "compact" "$base_url" <<< "$resp" 2>/dev/null)
+        [[ -n "$resp" ]] && out=$(__preprint_parse_hexagon "compact" "$base_url" "$short_term" <<< "$resp" 2>/dev/null)
 
         if [[ -z "$out" ]]; then
             local atom_order="descending"
