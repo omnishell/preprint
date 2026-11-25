@@ -560,6 +560,7 @@ __hexagon__() {
     }
 
     # Shared upload + metadata staging engine for both 'send' (new) and 'update' (new version)
+   
     __preprint_hexagon_stage_deposit() {
         local revise_target="${1:-}"
         local file="$PREPRINT_SEND_FILE" meta="$PREPRINT_SEND_META" title="$PREPRINT_SEND_TITLE"
@@ -677,7 +678,6 @@ __hexagon__() {
         # A. REVISION FLOW ('preprint paper update' / 'preprint paper send -u <id>')
         if [[ -n "$revise_target" ]]; then
             local clean_rev="${revise_target#hexagon:}"
-            # Strip trailing vN if it's a published identifier like 2611.00532v1
             if [[ "$clean_rev" =~ ^([0-9]{4}\.[0-9]{4,5})v[0-9]+$ ]]; then
                 clean_rev="${BASH_REMATCH[1]}"
             fi
@@ -691,7 +691,6 @@ __hexagon__() {
             body="${resp%$'\n'*}"
 
             if [[ "$http_code" == "409" ]]; then
-                # If it was an unpublished committed package, pause for corrections first, then revise
                 curl -sS -X POST -H "Authorization: Bearer $token" "${base_url}/api/v1/submissions/${clean_rev}/corrections" >/dev/null 2>&1 || true
                 resp=$(curl -sS -w "\n%{http_code}" -X POST \
                     -H "Authorization: Bearer $token" \
@@ -704,31 +703,33 @@ __hexagon__() {
             if [[ "$http_code" =~ ^20[01]$ ]]; then
                 draft_id=$(__preprint_parse_hexagon "extract_draft_id" "$base_url" <<< "$body")
                 [[ -z "$draft_id" ]] && draft_id="$clean_rev"
-            elif __preprint_draft_get "hexagon" "$clean_rev" >/dev/null 2>&1; then
-                draft_id="$clean_rev"
+
+                __log "Updating metadata on revision draft '$draft_id'..." -t info -l preprint
+                resp=$(curl -sS -w "\n%{http_code}" -X PATCH \
+                    -H "Authorization: Bearer $token" \
+                    -H "Content-Type: application/json" \
+                    -d "$meta_json" \
+                    "${base_url}/api/v1/submissions/${draft_id}" 2>&1)
+                http_code="${resp##*$'\n'}"
+                body="${resp%$'\n'*}"
+                if [[ "$http_code" != "200" ]]; then
+                    [[ -n "$tmp_zip" ]] && rm -f "$tmp_zip"
+                    __log "Failed updating metadata on revision draft '$draft_id' (HTTP $http_code)." -t error -l preprint
+                    echo "$body" >&2
+                    return 1
+                fi
+            elif [[ "$http_code" == "404" ]]; then
+                __log "No submission draft found for '$clean_rev' (HTTP 404); creating a new submission draft via /api/v1/submissions..." -t warning -l preprint
             else
                 [[ -n "$tmp_zip" ]] && rm -f "$tmp_zip"
                 __log "Failed to open revision draft for '$clean_rev' on Hexagon (HTTP $http_code)." -t error -l preprint
                 echo "$body" >&2
                 return 1
             fi
+        fi
 
-            __log "Updating metadata on revision draft '$draft_id'..." -t info -l preprint
-            resp=$(curl -sS -w "\n%{http_code}" -X PATCH \
-                -H "Authorization: Bearer $token" \
-                -H "Content-Type: application/json" \
-                -d "$meta_json" \
-                "${base_url}/api/v1/submissions/${draft_id}" 2>&1)
-            http_code="${resp##*$'\n'}"
-            body="${resp%$'\n'*}"
-            if [[ "$http_code" != "200" ]]; then
-                [[ -n "$tmp_zip" ]] && rm -f "$tmp_zip"
-                __log "Failed updating metadata on revision draft '$draft_id' (HTTP $http_code)." -t error -l preprint
-                echo "$body" >&2
-                return 1
-            fi
-        else
-            # B. NEW SUBMISSION FLOW ('preprint paper send')
+        # B. CREATE NEW SUBMISSION DRAFT (new deposit or fallback when published ID has no /revise draftId)
+        if [[ -z "$draft_id" ]]; then
             local existing_draft_id=""
             existing_draft_id=$(LC_ALL=C awk -F'\t' -v fn="$fname" -v t="$title" '
                 $1 == "hexagon" && ($4 == t || $7 ~ ("\\|" fn "$") || $6 ~ (fn "$")) { print $2; exit }
@@ -872,7 +873,7 @@ __hexagon__() {
         __log "Hexagon Math draft staged! Draft ID: $draft_id" -t success -l preprint
         __log "Run 'preprint paper get $draft_id -d hexagon' to inspect, or 'preprint paper publish $draft_id -d hexagon' to commit & publish." -t info -l preprint
     }
-
+    
     __preprint_provider_hexagon_send() {
         __preprint_hexagon_stage_deposit ""
     }
